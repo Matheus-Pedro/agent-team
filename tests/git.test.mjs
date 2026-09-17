@@ -16,6 +16,8 @@ const {
   gitWarnings,
   resetGitCache,
   normalizeBranchInfo,
+  missingBaseCommitMessage,
+  unknownBranchMessage,
 } = git;
 
 const MAINS = ['main', 'master'];
@@ -105,8 +107,9 @@ test('repositório sem commits: branch reconhecida, sem commit base e com aviso 
   assert.equal(hasBaseCommit(repo), false);
   const warnings = gitWarnings(repo, MAINS);
   assert.equal(warnings.length, 1);
+  assert.equal(warnings[0], missingBaseCommitMessage('main'));
   assert.match(warnings[0], /ainda não tem o commit base em main/);
-  assert.match(warnings[0], /no seu terminal/);
+  assert.match(warnings[0], /criado pelo usuário, no terminal dele/);
   assert.match(warnings[0], /antes de IMPLEMENTING/);
 });
 
@@ -161,8 +164,10 @@ test('git ausente do PATH vira unknown com motivo, sem lançar (CA-01.2)', () =>
 
   const warnings = withoutGit(() => gitWarnings(repo, MAINS));
   assert.equal(warnings.length, 1);
+  assert.equal(warnings[0], unknownBranchMessage('git não encontrado no PATH'));
   assert.match(warnings[0], /^Não foi possível identificar a branch atual \(git não encontrado no PATH\)\./);
-  assert.match(warnings[0], /alteram histórico serão bloqueados/);
+  assert.match(warnings[0], /alteram histórico ficam bloqueados/);
+  assert.match(warnings[0], /peça ao usuário para verificar o repositório/);
 });
 
 test('repositório ilegível vira unknown com o status do git, sem lançar', () => {
@@ -227,6 +232,47 @@ test('normalizeBranchInfo converte string e null (compatibilidade do ADR-001)', 
   assert.deepEqual(normalizeBranchInfo({ kind: 'detached' }), { kind: 'detached', name: null });
   const info = { kind: 'branch', name: 'main' };
   assert.deepEqual(normalizeBranchInfo(info), info);
+});
+
+test('as frases são o texto normativo do contrato §1, com a interpolação no lugar', () => {
+  assert.equal(
+    missingBaseCommitMessage('main'),
+    'Este repositório ainda não tem o commit base em main. O commit base tem de ser criado pelo usuário, ' +
+      'no terminal dele (agentes não commitam na principal), antes de IMPLEMENTING; depois o Orchestrator ' +
+      'cria a branch do work item a partir dele.',
+  );
+  assert.equal(
+    unknownBranchMessage('git não encontrado no PATH'),
+    'Não foi possível identificar a branch atual (git não encontrado no PATH). Comandos que alteram ' +
+      'histórico ficam bloqueados até isso ser resolvido; peça ao usuário para verificar o repositório.',
+  );
+  assert.match(missingBaseCommitMessage('master'), /commit base em master\./);
+  assert.match(unknownBranchMessage('git saiu com status 128'), /\(git saiu com status 128\)/);
+  assert.match(unknownBranchMessage(''), /\(motivo desconhecido\)/);
+});
+
+test('nenhuma frase fala na segunda pessoa: o agente também as lê na mensagem de bloqueio', () => {
+  // Uma frase como "crie você mesmo o commit" convidaria o agente a commitar na
+  // principal, que é o que a regra central proíbe (CA-01.1).
+  const repoSemCommit = tmpRepo({ branch: 'main' });
+  const repoComCommit = tmpRepo({ branch: 'main', commit: true });
+  const frases = [
+    missingBaseCommitMessage('main'),
+    missingBaseCommitMessage('master'),
+    unknownBranchMessage('git não encontrado no PATH'),
+    unknownBranchMessage(''),
+    ...gitWarnings(repoSemCommit, MAINS),
+    ...withoutGit(() => {
+      resetGitCache();
+      return gitWarnings(repoComCommit, MAINS);
+    }),
+  ];
+  resetGitCache();
+  assert.ok(frases.length >= 6);
+  for (const frase of frases) {
+    assert.doesNotMatch(frase, /\bvocê\b/i, frase);
+    assert.doesNotMatch(frase, /\b(seu|sua)\b/i, frase);
+  }
 });
 
 test('nenhuma mensagem expõe caminho absoluto do repositório', () => {

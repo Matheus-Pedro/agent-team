@@ -2,9 +2,10 @@
 // Objetivo: impedir que o modelo avance sem aprovação humana (merge, deploy,
 // edição do estado/aprovações). É uma barreira contra erro e alucinação do
 // modelo — não é um sandbox contra alguém tentando burlar deliberadamente.
+//
+// Este módulo não executa git: quem fala com o git é `lib/git.mjs` (ADR-001).
 
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 import {
   findTeamRoot,
   loadConfig,
@@ -13,19 +14,32 @@ import {
   checkApproval,
   gateEnabled,
 } from './core.mjs';
+import {
+  resolveBranch,
+  normalizeBranchInfo,
+  hasBaseCommit,
+  missingBaseCommitMessage,
+  unknownBranchMessage,
+} from './git.mjs';
+import { normalizeTarget, patternTarget, samePath, reachesKey, keyFilePath } from './paths.mjs';
+import { unquotedMeta } from './shell.mjs';
 
 const FILE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
 const SHELL_TOOLS = new Set(['Bash', 'PowerShell']);
+const SEARCH_TOOLS = new Set(['Grep', 'Glob']);
 
 const slash = (s) => String(s || '').replace(/\\/g, '/');
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 const TEAM_CLI_RE =
   /^\s*node(?:\.exe)?\s+(?:"[^"]*\.claude\/team\/bin\/team\.mjs"|'[^']*\.claude\/team\/bin\/team\.mjs'|[^\s"']*\.claude\/team\/bin\/team\.mjs)(?:\s|$)/i;
-const SHELL_META_RE = /[;&|<>`\r\n]|\$\(/;
 
+/**
+ * Lista branca do CLI do time. Metacaractere **dentro de aspas** não invalida a
+ * chamada (ADR-009): `--reason "G1 ok; ajustar RF-02"` é uma chamada isolada.
+ */
 export function isStandaloneTeamCall(command) {
-  return TEAM_CLI_RE.test(slash(command)) && !SHELL_META_RE.test(command);
+  return TEAM_CLI_RE.test(slash(command)) && unquotedMeta(command) === null;
 }
 
 export function protectedFileReason(filePath, cwd) {
@@ -45,13 +59,25 @@ const WRITE_VERBS_RE =
 const DELETE_VERBS_RE =
   /(\brm\b|\brmdir\b|\bdel\b|\berase\b|\brd\b|\bmv\b|\bren(ame)?\b|\bremove-item\b|\bmove-item\b|\brename-item\b|\bunlink\b|\brmsync\b)/i;
 
+// Alternativa nativa, exigida pelo RNF-05/CA-03.5: o bloqueio de shell por literal
+// continua conservador (Q-05), então a mensagem tem de dizer o que fazer em vez dele.
+const USE_SEARCH_TOOLS = 'Para pesquisar o código, use as ferramentas Grep ou Glob com o alvo dentro do projeto.';
+
 export function shellPathReason(command) {
   const n = slash(command).toLowerCase();
-  if (n.includes('approval.key')) return 'a chave de assinatura das aprovações não pode ser acessada';
-  if (/\.claude\/team(\/|\b)/.test(n)) {
-    return 'o runtime do time só pode ser usado como comando isolado: node "$HOME/.claude/team/bin/team.mjs" <args> (sem ;, &&, |, >, $( ))';
+  if (n.includes(path.basename(keyFilePath()).toLowerCase())) {
+    return `a chave de assinatura das aprovações não pode ser acessada. ${USE_SEARCH_TOOLS}`;
   }
-  if (/\.team\/(approvals|logs)\b/.test(n)) return 'aprovações e logs não podem ser manipulados via shell';
+  if (/\.claude\/team(\/|\b)/.test(n)) {
+    return (
+      'o runtime do time só pode ser usado como comando isolado: node "$HOME/.claude/team/bin/team.mjs" <args> ' +
+      '(sem ;, &&, |, >, $( ) fora de aspas). Para ler ou pesquisar o código do runtime, use Read, Grep ou Glob ' +
+      '(o alvo não pode ser o diretório do runtime instalado).'
+    );
+  }
+  if (/\.team\/(approvals|logs)\b/.test(n)) {
+    return 'aprovações e logs não podem ser manipulados via shell — para consultar, use `team status` ou a ferramenta Read';
+  }
   if (/\.team\/(state|config)\.json/.test(n)) return 'estado/config do time não podem ser manipulados via shell — use o CLI `team` (leitura: ferramenta Read)';
   if (/(^|[\s"'=/])\.team(\/|[\s"']|$)/.test(n) && DELETE_VERBS_RE.test(n)) return 'o diretório .team não pode ser removido ou movido pelo agente';
   if (/\bgit\s+clean\b[^;&|]*\s-[a-z]*x/i.test(command)) return '`git clean -x/-X` apagaria o .team/ (ignorado pelo git)';
@@ -59,24 +85,51 @@ export function shellPathReason(command) {
   return null;
 }
 
-export function detectMerge(command, branch, mainBranches) {
+// ---------- git (ADR-001) ----------
+
+/**
+ * Classifica o comando **só pelo texto**, sem consultar o git.
+ * @returns {{historyAltering: boolean, targetsMain: boolean, label: string}|null}
+ *   `targetsMain: true` = o comando alcança a principal independentemente da
+ *   branch atual; `false` = só importa se a branch atual for a principal.
+ */
+export function classifyGitCommand(command, mainBranches) {
   const n = slash(command);
-  const alt = mainBranches.map(escapeRe).join('|');
+  const mains = (mainBranches?.length ? mainBranches : ['main', 'master']);
+  const alt = mains.map(escapeRe).join('|');
   const end = String.raw`(?=$|[\s;&|)"'])`;
   const switchesToMain = new RegExp(String.raw`\bgit\s+(checkout|switch)\s+(${alt})${end}`).test(n);
-  const onMain = (branch && mainBranches.includes(branch)) || switchesToMain;
+  // Uma linha pode conter mais de um verbo (`git merge x && git push origin main`):
+  // reúne todos os candidatos, na ordem da v1.0, e o que alcança a principal
+  // independentemente da branch atual tem precedência.
+  const found = [];
+  const add = (targetsMain, label) => found.push({ historyAltering: true, targetsMain, label });
 
-  if (/\bgh\s+pr\s+merge\b/.test(n)) return 'gh pr merge';
-  if (/\bgit\s+merge\b/.test(n) && onMain) return 'merge na branch principal';
-  if (/\bgit\s+(commit|cherry-pick|revert|am|rebase)\b/.test(n) && onMain) return 'alteração de histórico na branch principal';
+  if (/\bgh\s+pr\s+merge\b/.test(n)) add(true, 'gh pr merge');
+  if (/\bgit\s+merge\b/.test(n)) add(switchesToMain, 'merge na branch principal');
+  if (/\bgit\s+(commit|cherry-pick|revert|am|rebase)\b/.test(n)) {
+    add(switchesToMain, 'alteração de histórico na branch principal');
+  }
   if (/\bgit\s+push\b/.test(n)) {
-    if (onMain) return 'push a partir da branch principal';
-    if (new RegExp(String.raw`\bgit\s+push\b[^;&|]*[\s:+](${alt})${end}`).test(n)) return 'push para a branch principal';
+    if (new RegExp(String.raw`\bgit\s+push\b[^;&|]*[\s:+](${alt})${end}`).test(n)) {
+      add(true, 'push para a branch principal');
+    } else {
+      add(switchesToMain, 'push a partir da branch principal');
+    }
   }
   if (new RegExp(String.raw`\bgit\s+(update-ref\s+refs/heads/|branch\s+(-f|--force|-M|-D)\s+)(${alt})${end}`).test(n)) {
-    return 'alteração direta da branch principal';
+    add(true, 'alteração direta da branch principal');
   }
-  return null;
+  if (!found.length) return null;
+  return found.find((a) => a.targetsMain) || found[0];
+}
+
+/** Mantida por compatibilidade: combina a classificação com uma branch em string. */
+export function detectMerge(command, branch, mainBranches) {
+  const action = classifyGitCommand(command, mainBranches);
+  if (!action) return null;
+  const mains = mainBranches?.length ? mainBranches : ['main', 'master'];
+  return action.targetsMain || (branch && mains.includes(branch)) ? action.label : null;
 }
 
 export function detectDeploy(command, deployCfg) {
@@ -92,15 +145,59 @@ export function detectDeploy(command, deployCfg) {
   return { production: test(deployCfg.production_patterns) };
 }
 
-function currentBranch(cwd) {
+// ---------- buscas (ADR-003) ----------
+
+/**
+ * Alvos que a chamada realmente alcança. O **texto** de `pattern`, `glob` e `type`
+ * nunca é inspecionado: só o prefixo estático absoluto (ou que começa com `..`).
+ * @returns {string[]} caminhos absolutos normalizados
+ */
+export function searchTargets(toolName, toolInput = {}, cwd) {
+  const add = (t) => (t ? [t] : []);
+  if (toolName === 'Read') {
+    return add(normalizeTarget(cwd, toolInput.file_path || toolInput.notebook_path || toolInput.path));
+  }
+  if (!SEARCH_TOOLS.has(toolName)) return [];
+  const targets = [
+    ...add(normalizeTarget(cwd, toolInput.path || cwd)),
+    ...add(patternTarget(cwd, toolInput.pattern)),
+  ];
+  if (toolName === 'Grep') targets.push(...add(patternTarget(cwd, toolInput.glob)));
+  return targets;
+}
+
+const SEARCH_TARGET_REASON =
+  'busca cujo alvo alcança a chave de assinatura das aprovações não é permitida; ' +
+  'restrinja o alvo ao diretório do projeto (o padrão da busca pode citar qualquer texto).';
+const KEY_READ_REASON =
+  'a chave de assinatura das aprovações não pode ser lida; ela nunca é necessária para o trabalho. ' +
+  'Para conferir uma aprovação, use `team status`; para pesquisar o código, use Grep ou Glob no projeto.';
+
+// ---------- contexto de aplicação (ADR-005) ----------
+
+function rootFor(input) {
+  const toolInput = input?.tool_input || {};
+  const cwd = input?.cwd || process.cwd();
+  const filePath = toolInput.file_path || toolInput.notebook_path || toolInput.path || '';
+  return findTeamRoot(cwd) || (filePath ? findTeamRoot(path.dirname(path.resolve(cwd, filePath))) : null);
+}
+
+/**
+ * Há time ativo neste diretório e o guard está ligado? Calculado **antes** e
+ * separadamente da avaliação, para que o hook saiba o que fazer se a avaliação
+ * lançar (ADR-005). Nunca lança: na dúvida, `enforcing: false`.
+ */
+export function enforcementContext(input) {
   try {
-    return execFileSync('git', ['-C', cwd, 'rev-parse', '--abbrev-ref', 'HEAD'], {
-      encoding: 'utf8',
-      timeout: 3000,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
+    const root = rootFor(input);
+    if (!root) return { root: null, enforcing: false };
+    try {
+      return { root, enforcing: loadConfig(root).enforce !== false };
+    } catch {
+      return { root, enforcing: true }; // config corrompida: o padrão é aplicar
+    }
   } catch {
-    return null;
+    return { root: null, enforcing: false };
   }
 }
 
@@ -108,7 +205,8 @@ const deny = (reason) => ({ deny: true, reason });
 const allow = { deny: false };
 
 /**
- * Avalia uma chamada de ferramenta. `deps.getBranch` pode ser trocado nos testes.
+ * Avalia uma chamada de ferramenta. `deps.getBranch` pode ser trocado nos testes
+ * (aceita `BranchInfo`, string ou `null`); `deps.hasBaseCommit` também.
  * Retorna { deny: boolean, reason?: string }.
  */
 export function evaluateToolCall(input, deps = {}) {
@@ -117,7 +215,7 @@ export function evaluateToolCall(input, deps = {}) {
   const cwd = input.cwd || process.cwd();
   const filePath = toolInput.file_path || toolInput.notebook_path || toolInput.path || '';
 
-  const root = findTeamRoot(cwd) || (filePath ? findTeamRoot(path.dirname(path.resolve(cwd, filePath))) : null);
+  const root = rootFor(input);
   if (!root) return allow;
 
   let config;
@@ -133,10 +231,18 @@ export function evaluateToolCall(input, deps = {}) {
     return r ? deny(r) : allow;
   }
 
-  if (toolName === 'Read' || toolName === 'Grep' || toolName === 'Glob') {
-    const n = slash(`${filePath} ${toolInput.pattern || ''} ${toolInput.glob || ''}`).toLowerCase();
-    if (n.includes('approval.key')) return deny('a chave de assinatura das aprovações não pode ser lida');
-    if (toolName !== 'Read' && /\.claude\/team(\/|\s|$)/.test(n)) return deny('busca no runtime do time não é permitida');
+  if (toolName === 'Read') {
+    const key = keyFilePath();
+    for (const target of searchTargets('Read', toolInput, cwd)) {
+      if (samePath(target, key)) return deny(KEY_READ_REASON);
+    }
+    return allow;
+  }
+
+  if (SEARCH_TOOLS.has(toolName)) {
+    for (const target of searchTargets(toolName, toolInput, cwd)) {
+      if (reachesKey(target)) return deny(SEARCH_TARGET_REASON);
+    }
     return allow;
   }
 
@@ -155,19 +261,35 @@ export function evaluateToolCall(input, deps = {}) {
     state = { status: 'IDLE', work: null };
   }
   const track = state.work?.track || 'G';
+  const mains = config.main_branches || ['main', 'master'];
 
-  const mentionsGit = /\b(git|gh)\b/.test(command);
-  if (mentionsGit) {
-    const branch = mentionsGit ? (deps.getBranch || currentBranch)(cwd) : null;
-    const merge = detectMerge(command, branch, config.main_branches || ['main', 'master']);
-    if (merge) {
-      const g3ok = !gateEnabled(config, track, 'G3') || checkApproval(root, state, 'G3').valid;
-      if (state.status !== 'MERGING' || !g3ok) {
+  if (/\b(git|gh)\b/.test(command)) {
+    const action = classifyGitCommand(command, mains);
+    if (action) {
+      const branch = normalizeBranchInfo((deps.getBranch || resolveBranch)(cwd));
+      // Branch indeterminada: nada que altere histórico passa (CA-01.2, RNF-04).
+      if (branch.kind === 'unknown') {
         return deny(
-          `${merge} só é permitido no estado MERGING, depois do gate G3 aprovado pelo usuário ` +
-            `(estado atual: ${state.status}${g3ok ? '' : ', G3 sem aprovação válida'}). ` +
-            'Trabalhe na branch do work item e leve o resultado ao gate G3.',
+          `${unknownBranchMessage(branch.detail)} Peça ao usuário para verificar o repositório ` +
+            'e informe que o comando não foi executado.',
         );
+      }
+      // `no-repo` e `detached` não são a principal (CA-01.7, comportamento da v1.0).
+      const onMain = action.targetsMain || (branch.kind === 'branch' && mains.includes(branch.name));
+      if (onMain) {
+        const g3ok = !gateEnabled(config, track, 'G3') || checkApproval(root, state, 'G3').valid;
+        if (state.status !== 'MERGING' || !g3ok) {
+          let reason =
+            `${action.label} só é permitido no estado MERGING, depois do gate G3 aprovado pelo usuário ` +
+            `(estado atual: ${state.status}${g3ok ? '' : ', G3 sem aprovação válida'}). ` +
+            'Trabalhe na branch do work item e leve o resultado ao gate G3.';
+          // Só agora vale pagar a sonda de commit base (ADR-001: preguiçosa).
+          if (branch.kind === 'branch' && mains.includes(branch.name)
+            && (deps.hasBaseCommit || hasBaseCommit)(cwd) === false) {
+            reason += ` ${missingBaseCommitMessage(branch.name)}`;
+          }
+          return deny(reason);
+        }
       }
     }
   }

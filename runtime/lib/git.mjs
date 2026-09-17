@@ -134,14 +134,19 @@ function computeBaseCommit(dir) {
   return null;
 }
 
-// ---------- mensagens (contrato §1 e §6) ----------
+// ---------- mensagens (contrato §1, texto normativo) ----------
+//
+// As duas frases são lidas pelo usuário (via CLI) e pelo agente (via mensagem de
+// bloqueio do guard). Por isso nenhuma delas fala na segunda pessoa: um "crie o
+// commit" lido pelo agente o convidaria a commitar na principal, que é justamente
+// o que a regra central proíbe.
 
 /** Frase do commit base, reaproveitada pelo guard na mensagem de bloqueio (CA-01.1). */
 export function missingBaseCommitMessage(branch) {
   return (
-    `Este repositório ainda não tem o commit base em ${branch}. Crie-o você mesmo, no seu terminal ` +
-    '(os agentes não commitam na principal), antes de IMPLEMENTING; depois o Orchestrator cria a branch ' +
-    'do work item a partir dele.'
+    `Este repositório ainda não tem o commit base em ${branch}. O commit base tem de ser criado pelo ` +
+    'usuário, no terminal dele (agentes não commitam na principal), antes de IMPLEMENTING; depois o ' +
+    'Orchestrator cria a branch do work item a partir dele.'
   );
 }
 
@@ -149,7 +154,8 @@ export function missingBaseCommitMessage(branch) {
 export function unknownBranchMessage(detail) {
   return (
     `Não foi possível identificar a branch atual (${detail || 'motivo desconhecido'}). ` +
-    'Comandos que alteram histórico serão bloqueados até isso ser resolvido.'
+    'Comandos que alteram histórico ficam bloqueados até isso ser resolvido; peça ao usuário para ' +
+    'verificar o repositório.'
   );
 }
 

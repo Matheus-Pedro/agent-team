@@ -7,6 +7,8 @@ import path from 'node:path';
 import {
   TeamError,
   GATES,
+  TRACKS,
+  CONFIGURABLE_GATES,
   findTeamRoot,
   initTeam,
   loadConfig,
@@ -22,12 +24,13 @@ import {
   gateEnabled,
   appendLog,
 } from '../lib/core.mjs';
+import { resolveBranch, hasBaseCommit, gitWarnings } from '../lib/git.mjs';
 
 const HELP = `team — estado e fluxo do time de agentes
 
 Uso: node "$HOME/.claude/team/bin/team.mjs" <comando> [opções] [--root <dir>]
 
-  init                                   cria .team/ no projeto (config padrão: todos os gates ligados)
+  init                                   cria .team/ no projeto (padrão: trilha P sem G1 e G2; M e G com todos)
   start <slug> --track P|M|G [--title T] inicia um work item (estado PLANNING)
   status [--json]                        estado, gates, transições possíveis e tarefas
   move <ESTADO> [--reason R]             muda de fase (valida transição e aprovações)
@@ -74,6 +77,34 @@ function resolveRoot({ forInit = false } = {}) {
   return root;
 }
 
+/**
+ * Fatos de git para a saída do CLI (ADR-001, contracts.md §1 e §2). Fora de
+ * repositório não há aviso nenhum e nada falha (CA-01.6).
+ */
+function gitInfo(root, config) {
+  const info = resolveBranch(root);
+  const repo = info.kind !== 'no-repo';
+  return {
+    repo,
+    branch: info.kind === 'branch' ? info.name : null,
+    branch_kind: info.kind,
+    has_base_commit: repo ? hasBaseCommit(root) : null,
+    warnings: gitWarnings(root, config.main_branches),
+  };
+}
+
+/** `Gates por trilha: P → G3, G4, PROD | M → G1..G4, PROD | ...` (CA-06.3). */
+function gatesByTrackLine(config) {
+  const first = CONFIGURABLE_GATES[0];
+  const last = CONFIGURABLE_GATES[CONFIGURABLE_GATES.length - 1];
+  const parts = TRACKS.map((track) => {
+    const enabled = CONFIGURABLE_GATES.filter((g) => gateEnabled(config, track, g));
+    const label = enabled.length === CONFIGURABLE_GATES.length ? `${first}..${last}` : enabled.join(', ');
+    return `${track} → ${[...(label ? [label] : []), 'PROD'].join(', ')}`;
+  });
+  return `Gates por trilha: ${parts.join(' | ')}`;
+}
+
 function gateLine(root, state, config) {
   if (!state.work) return '';
   return GATES.map((g) => {
@@ -90,6 +121,7 @@ function statusCmd() {
   const state = loadState(root);
   const transitions = availableTransitions(root, state, config);
   const ready = readyTasks(state);
+  const git = gitInfo(root, config);
 
   if (opt.json) {
     out({
@@ -97,6 +129,7 @@ function statusCmd() {
       project: state.project,
       status: state.status,
       work: state.work,
+      git,
       gates: state.work
         ? Object.fromEntries(GATES.map((g) => [g, {
             enabled: gateEnabled(config, state.work.track, g),
@@ -111,6 +144,7 @@ function statusCmd() {
   }
 
   const lines = [`Projeto: ${state.project}   (${root})`, `Estado:  ${state.status}`];
+  for (const w of git.warnings) lines.push(`⚠️ ${w}`);
   if (!state.work) {
     if (state.last_work) lines.push(`Último work item: ${state.last_work.id}`);
     lines.push('Nenhum work item ativo. Próximo passo: `team start <slug> --track P|M|G --title "..."`.');
@@ -180,7 +214,11 @@ function main() {
     case 'init': {
       const root = resolveRoot({ forInit: true });
       initTeam(root);
-      out(`.team/ criado em ${root} (todos os gates ligados; .team/ adicionado ao .gitignore se houver git).`);
+      const config = loadConfig(root);
+      const lines = [`.team/ criado em ${root} (.team/ adicionado ao .gitignore se houver git).`];
+      lines.push(gatesByTrackLine(config));
+      for (const w of gitInfo(root, config).warnings) lines.push(`⚠️ ${w}`);
+      out(lines.join('\n'));
       break;
     }
     case 'start': {

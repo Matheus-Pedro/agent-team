@@ -129,12 +129,18 @@ export const DEFAULT_DEPLOY_PATTERNS = [
   String.raw`\bgh\s+workflow\s+run\b`,
   String.raw`\b(npm|pnpm|yarn|bun)\s+(run\s+)?deploy\b`,
   String.raw`\bdotnet\s+publish\b.*PublishProfile`,
+  // Instalar/desinstalar o agent-team é deploy (ADR-002): o instalador reescreve o
+  // runtime e os hooks, e o desinstalador os remove.
+  String.raw`\b(un)?install:claude\b`,
+  String.raw`\bnode(\.exe)?\s+\S*scripts/(un)?install\.mjs`,
 ];
 
 export const DEFAULT_PRODUCTION_PATTERNS = [
   String.raw`--prod\b`,
   String.raw`\bprod(uction)?\b`,
   String.raw`\bprd\b`,
+  // Instalar no diretório real do usuário (sem --claude-dir) é produção (ADR-002).
+  String.raw`^(?!.*--claude-dir).*(\b(un)?install:claude\b|\bnode(\.exe)?\s+\S*scripts/(un)?install\.mjs)`,
 ];
 
 export function defaultConfig() {
@@ -144,7 +150,9 @@ export function defaultConfig() {
     enforce: true,
     main_branches: ['main', 'master'],
     max_rework_attempts: 2,
-    gates: { P: allOn(), M: allOn(), G: allOn() },
+    // Trilha P nasce sem G1 e G2 (ADR-008): bugfix não aprova requisitos nem
+    // arquitetura. G3 (merge), G4 (deploy) e PROD (sempre) continuam valendo.
+    gates: { P: { G1: false, G2: false, G3: true, G4: true }, M: allOn(), G: allOn() },
     deploy: {
       patterns: DEFAULT_DEPLOY_PATTERNS,
       production_patterns: DEFAULT_PRODUCTION_PATTERNS,
@@ -284,6 +292,11 @@ export function approvalFile(root, workId, gate) {
   return path.join(teamPaths(root).approvals, workId, `${gate}.json`);
 }
 
+/** Arquivo da reprovação. Nome congelado na v1.1 (ADR-007, regra 4). */
+export function rejectionFile(root, workId, gate) {
+  return path.join(teamPaths(root).approvals, workId, `${gate}.rejected.json`);
+}
+
 /**
  * Registra a decisão do usuário sobre um gate. Só deve ser chamado pelo hook
  * UserPromptSubmit (mensagem digitada pelo usuário) — nunca pelo CLI.
@@ -310,42 +323,106 @@ export function recordDecision(root, { gate, decision, note = '' }) {
   rec.signature = sign(rec, loadOrCreateKey());
   const file = decision === 'approved'
     ? approvalFile(root, state.work.id, gate)
-    : path.join(teamPaths(root).approvals, state.work.id, `${gate}.rejected.json`);
+    : rejectionFile(root, state.work.id, gate);
   writeJsonAtomic(file, rec);
   appendLog(root, { actor: 'user', event: decision, gate, work: state.work.id, note: rec.note || undefined });
   return rec;
 }
 
-/** Retorna { valid, reason, record } para a aprovação do gate no work item atual. */
-export function checkApproval(root, state, gate) {
-  if (!state.work) return { valid: false, reason: 'sem work item ativo' };
-  const file = approvalFile(root, state.work.id, gate);
-  let rec;
+const NO_KEY_REASON = 'chave de aprovação ausente — reinstale o runtime';
+
+function loadKey() {
   try {
-    rec = readJson(file);
+    return Buffer.from(fs.readFileSync(KEY_FILE, 'utf8').trim(), 'hex');
   } catch {
-    return { valid: false, reason: `${gate} não aprovado` };
+    return null;
   }
-  let key;
+}
+
+function readDecisionFile(file) {
   try {
-    key = Buffer.from(fs.readFileSync(KEY_FILE, 'utf8').trim(), 'hex');
+    return readJson(file);
   } catch {
-    return { valid: false, reason: 'chave de aprovação ausente — reinstale o runtime' };
+    return null; // ausente ou ilegível: tratado como "não existe"
   }
+}
+
+function signatureOk(rec, key) {
   const expected = sign(rec, key);
   const given = String(rec.signature || '');
-  const sigOk = given.length === expected.length
+  return given.length === expected.length
     && crypto.timingSafeEqual(Buffer.from(given), Buffer.from(expected));
-  if (!sigOk) return { valid: false, reason: `assinatura inválida em ${gate}` };
-  if (rec.decision !== 'approved' || rec.actor !== 'user') return { valid: false, reason: `${gate} não aprovado` };
+}
+
+const decidedAtMs = (rec) => Date.parse(rec?.decided_at ?? '');
+
+/** Avalia a aprovação (`<gate>.json`) exatamente como na v1.0. */
+function checkApprovalRecord(root, state, gate, key) {
+  const rec = readDecisionFile(approvalFile(root, state.work.id, gate));
+  if (!rec) return { valid: false, present: false, reason: `${gate} não aprovado` };
+  if (!key) return { valid: false, present: true, reason: NO_KEY_REASON };
+  if (!signatureOk(rec, key)) return { valid: false, present: true, reason: `assinatura inválida em ${gate}` };
+  if (rec.decision !== 'approved' || rec.actor !== 'user') {
+    return { valid: false, present: true, reason: `${gate} não aprovado` };
+  }
   if (rec.work_id !== state.work.id || rec.gate !== gate || rec.state_at_decision !== GATE_STATE[gate]) {
-    return { valid: false, reason: `registro de ${gate} não corresponde ao work item atual` };
+    return { valid: false, present: true, reason: `registro de ${gate} não corresponde ao work item atual` };
   }
   const revokedAt = state.work.revocations?.[gate];
   if (revokedAt && new Date(rec.decided_at) <= new Date(revokedAt)) {
-    return { valid: false, reason: `${gate} foi revogado por retrabalho em ${revokedAt}` };
+    return { valid: false, present: true, reason: `${gate} foi revogado por retrabalho em ${revokedAt}` };
   }
-  return { valid: true, record: rec };
+  return { valid: true, present: true, record: rec };
+}
+
+/** A reprovação é do mesmo gate/work item, assinada e com timestamp legível? */
+function rejectionIsConsistent(rec, state, gate, key) {
+  return signatureOk(rec, key)
+    && rec.decision === 'rejected'
+    && rec.actor === 'user'
+    && rec.work_id === state.work.id
+    && rec.gate === gate
+    && rec.state_at_decision === GATE_STATE[gate]
+    && Number.isFinite(decidedAtMs(rec));
+}
+
+/**
+ * Retorna { valid, reason, record } para a aprovação do gate no work item atual.
+ * A decisão **mais recente** do usuário prevalece (ADR-004): a aprovação é
+ * verificada como na v1.0 e depois comparada com a reprovação assinada, se houver.
+ * Em empate de `decided_at`, a reprovação ganha. Os dois arquivos continuam em
+ * disco, com os nomes da v1.0 (ADR-007).
+ */
+export function checkApproval(root, state, gate) {
+  if (!state.work) return { valid: false, reason: 'sem work item ativo' };
+  const key = loadKey();
+  const approved = checkApprovalRecord(root, state, gate, key);
+  const result = approved.valid
+    ? { valid: true, record: approved.record }
+    : { valid: false, reason: approved.reason };
+
+  const rejection = readDecisionFile(rejectionFile(root, state.work.id, gate));
+  if (!rejection) return result;
+  if (!key) return { valid: false, reason: NO_KEY_REASON };
+  if (!rejectionIsConsistent(rejection, state, gate, key)) {
+    // Fail-closed (RNF-04): um registro inconsistente nunca aprova, só nega.
+    return {
+      valid: false,
+      reason: `registro de reprovação de ${gate} inconsistente — peça ao usuário para decidir novamente`,
+    };
+  }
+  if (!approved.present) {
+    return { valid: false, reason: `${gate} foi reprovado pelo usuário em ${rejection.decided_at}` };
+  }
+  if (!approved.valid) return result; // razão da aprovação é mais específica
+  const approvedAt = decidedAtMs(approved.record);
+  if (!(Number.isFinite(approvedAt) && approvedAt > decidedAtMs(rejection))) {
+    return {
+      valid: false,
+      reason: `${gate} foi reprovado pelo usuário em ${rejection.decided_at}, depois da aprovação`,
+    };
+  }
+  return result;
 }
 
 export function gateEnabled(config, track, gate) {
