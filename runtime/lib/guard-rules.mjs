@@ -46,7 +46,12 @@ const TEAM_CLI_RE =
 // invalida a chamada isolada. A US-07 (aspas liberando metacaractere, ADR-009) saiu da
 // v1.1: as regras de citação divergem entre PowerShell e bash (`\"`, aspas tipográficas,
 // `$'...'`), e um scanner que erre para o lado permissivo libera o comando inteiro.
-const SHELL_META_RE = /[;&|<>`\r\n]|\$\(/;
+// `(` e `)` entraram na v1.1 (brecha que já existia na v1.0): no PowerShell, em modo de
+// argumento, `(cmd)` e `@(cmd)` executam `cmd`; no bash, `(` sem aspas abre subshell.
+// `{ }` não entram: no PowerShell um scriptblock passado a um executável nativo vira
+// texto (`-encodedCommand <base64>`) e só executaria se o executável fosse o próprio
+// powershell — aqui é sempre `node`.
+const SHELL_META_RE = /[;&|<>`()\r\n]|\$\(/;
 
 /** Lista branca do CLI do time: só a chamada isolada, sem nenhum metacaractere. */
 export function isStandaloneTeamCall(command) {
@@ -82,7 +87,7 @@ export function shellPathReason(command) {
   if (/\.claude\/team(\/|\b)/.test(n)) {
     return (
       'o runtime do time só pode ser usado como comando isolado: node "$HOME/.claude/team/bin/team.mjs" <args> ' +
-      '(sem ;, &, |, <, >, `, $( nem quebra de linha, nem mesmo entre aspas). Para ler ou pesquisar o código do runtime, use Read, Grep ou Glob ' +
+      '(sem ;, &, |, <, >, `, ( ), $( nem quebra de linha, nem mesmo entre aspas). Para ler ou pesquisar o código do runtime, use Read, Grep ou Glob ' +
       '(o alvo não pode ser o diretório do runtime instalado).'
     );
   }

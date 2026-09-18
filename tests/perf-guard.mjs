@@ -164,7 +164,7 @@ const scenarios = [
     label: 'Projeto com time · comando git (git commit)',
     expect: 0,
     payload: preToolUse(project, 'Bash', { command: 'git commit -m "wip"' }),
-    note: 'executa `git rev-parse` para descobrir a branch e lê o estado',
+    note: 'executa `git symbolic-ref` (1 spawn) para descobrir a branch e lê o estado',
   },
   {
     id: 'deploy-bloqueado',

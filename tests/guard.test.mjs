@@ -577,16 +577,61 @@ test('alias de um ANCESTRAL da chave (sem nome da chave nem do runtime) é bloqu
 
 test('nome 8.3 que não pode ser expandido bloqueia (fail-closed)', { skip: !IS_WIN }, () => {
   const root = startedProject();
-  const inventado = path.join(os.tmpdir(), 'NAOEXIS~7', 'sub');
+  const inventado = path.join(os.tmpdir(), 'NAOEX~7', 'sub');
   const res = search(root, 'Grep', { pattern: 'x', path: inventado });
   assert.equal(res.deny, true);
   assert.match(res.reason, /nome curto/);
   assert.match(res.reason, /caminho completo/); // RNF-05: o que fazer
   assert.equal(read(root, path.join(inventado, 'a.txt')).deny, true);
+  // formas 8.3 inexistentes continuam bloqueando (inclusive com extensão)
+  for (const seg of ['CLAUDE~9', 'ALGUEM~1', 'A~1', 'ABCDE~12', 'PROGRA~1.TXT']) {
+    const alvo = path.join(os.tmpdir(), 'nao-existe-8dot3', seg, 'x.md');
+    assert.equal(read(root, alvo).deny, true, seg);
+  }
   // nome com ~ e dígito que EXISTE de verdade é só um nome: expande para si mesmo e libera
   const real = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'at-til-')), 'versao~2');
   fs.mkdirSync(real);
   assert.equal(search(root, 'Grep', { pattern: 'x', path: real }).deny, false);
+});
+
+test('nome longo com ~ e dígito que ainda não existe NÃO é tratado como 8.3 (NIT da rechecagem)', () => {
+  const root = startedProject();
+  for (const nome of ['nao~1existe.md', 'rascunho.v2~1.md', 'arquivo-muito-longo~1', 'ABCDEFG~1', 'ABC~1.HTML', '.cache~1']) {
+    const alvo = path.join(root, 'docs', nome);
+    assert.equal(read(root, alvo).deny, false, nome);
+    assert.equal(search(root, 'Grep', { pattern: 'x', path: alvo }).deny, false, nome);
+  }
+});
+
+test('parênteses executam comando no PowerShell (e subshell no bash): a lista branca os recusa', () => {
+  const root = startedProject();
+  const vetores = [
+    // vetor exato da rechecagem, na forma de chamada do CLI
+    'node "$HOME/.claude/team/bin/team.mjs" status (git merge feat)',
+    'node "$HOME/.claude/team/bin/team.mjs" status @(git merge feat)',
+    'node ~/.claude/team/bin/team.mjs status (Remove-Item -Recurse -Force .team) @(git push origin main)',
+    'node "$HOME/.claude/team/bin/team.mjs" move TESTING --reason "(git merge feat)"',
+    "node ~/.claude/team/bin/team.mjs move TESTING --reason '(git merge feat)'",
+    'node "$HOME/.claude/team/bin/team.mjs" start --slug x --title (git merge feat)',
+    'node "$HOME/.claude/team/bin/team.mjs" start --slug x --title "Evolução (v1.1)"',
+    'node ~/.claude/team/bin/team.mjs status )',
+  ];
+  for (const c of vetores) {
+    assert.equal(isStandaloneTeamCall(c), false, c);
+    const res = bash(root, c);
+    assert.equal(res.deny, true, c);
+    assert.match(res.reason, /\( \)/, c); // a mensagem lista os parênteses
+  }
+  // chamadas isoladas legítimas continuam permitidas
+  for (const c of [
+    'node "$HOME/.claude/team/bin/team.mjs" status',
+    'node "C:\\Users\\x\\.claude\\team\\bin\\team.mjs" move ARCHITECTING --reason "G1 ok"',
+    "node ~/.claude/team/bin/team.mjs task add T1 --agent product --title 'Requisitos v1.1 - fase 2'",
+    'node "$HOME/.claude/team/bin/team.mjs" start --slug x --title "Evolução {v1.1}"',
+  ]) {
+    assert.equal(isStandaloneTeamCall(c), true, c);
+    assert.equal(bash(root, c).deny, false, c);
+  }
 });
 
 test('defesa em profundidade: nome da chave ou do runtime (.claude/team, CLAUDE~N) no alvo nega', () => {

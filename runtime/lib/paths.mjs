@@ -53,25 +53,33 @@ export function stripAdminShare(p) {
   return `${m[2].toUpperCase()}:${m[3] ? m[3] : '\\'}`;
 }
 
-const SHORT_NAME_RE = /~\d/;
+// Segmento com cara de nome curto 8.3: até 6 caracteres sem ponto, `~` e dígitos, base de
+// no máximo 8 caracteres e extensão opcional de até 3 (`CLAUDE~2`, `ALGUEM~1`, `PROGRA~1.TXT`).
+// `nao~1existe.md` é um nome longo comum, não 8.3: não dispara expansão nem bloqueio.
+const SHORT_SEGMENT_RE = /^([^.~\\/]{1,6}~\d{1,6})(\.[^.\\/]{1,3})?$/;
+const isShortSegment = (seg) => {
+  const m = SHORT_SEGMENT_RE.exec(seg);
+  return Boolean(m) && m[1].length <= 8;
+};
+const hasShortSegment = (p) => String(p).split(/[\\/]+/).some(isShortSegment);
 const unresolved = new Set();
 
 /**
  * Expande nomes curtos 8.3 (`C:\Users\x\CLAUDE~2\team`) pelo sistema de arquivos.
- * Só roda quando algum segmento tem `~<dígito>`. Se o caminho não existe inteiro,
+ * Só roda quando algum segmento tem forma 8.3 (`isShortSegment`). Se o caminho não existe inteiro,
  * expande o maior ancestral existente e recoloca o resto — desde que o resto não
  * tenha mais nenhum segmento 8.3. Se tiver (não dá para saber aonde o alias leva),
  * o alvo fica marcado como **não resolvido** e o guard bloqueia (fail-closed).
  * Nunca lança.
  */
 function expandShortNames(p) {
-  if (process.platform !== 'win32' || !SHORT_NAME_RE.test(p)) return p;
+  if (process.platform !== 'win32' || !hasShortSegment(p)) return p;
   let head = p;
   const tail = [];
   for (let i = 0; i < 64; i++) {
     try {
       const real = stripLongPrefix(fs.realpathSync.native(head));
-      if (tail.some((s) => SHORT_NAME_RE.test(s))) break;
+      if (tail.some(isShortSegment)) break;
       return tail.length ? path.join(real, ...tail) : real;
     } catch {
       const parent = path.dirname(head);

@@ -33,6 +33,8 @@ A US-07 (títulos e motivos com metacaracteres entre aspas) foi adiada para a 1.
 
 ### Fixed
 
+- **A chamada do CLI `team` feita por um agente passou a recusar parênteses** (`(` e `)`), em qualquer shell e também entre aspas, por segurança. O efeito colateral é que títulos e motivos com parênteses precisam ser reescritos.
+
 - **US-01 — Commit na principal sem commits.** O guard passou a reconhecer como principal uma branch que ainda não tem commits e bloqueia `git commit` de agente nela. Se a branch atual não puder ser identificada, comandos que alteram histórico são bloqueados. HEAD destacado continua como na 1.0.0.
 - **US-04 — Vale a última decisão sobre o gate.** Uma `REPROVAR Gx` enviada depois de `APROVAR Gx` anula a aprovação, no CLI e no guard. Uma aprovação posterior volta a valer. Em empate de horário, vale a reprovação. O log de auditoria mantém todas as decisões.
 
