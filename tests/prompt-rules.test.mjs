@@ -82,6 +82,26 @@ test('palavra extra na primeira linha é conversa (RF-14)', () => {
   assert.equal(classifyPrompt(null).kind, 'none');
 });
 
+test('pergunta ou ";" depois do gate nunca é decisão (ADR-006 passo 2: só . ! : , …)', () => {
+  const perguntas = ['APROVAR G1?', 'Aprovado G1?', 'APROVAR G1;', 'REPROVAR G1?', 'APROVAR PROD?', 'APROVAR G1 ?',
+    'APROVAR G1?!', 'REPROVAR G1; faltou o ADR', 'APROVAR?', 'aprovado?'];
+  for (const p of perguntas) {
+    const r = classifyPrompt(p);
+    assert.notEqual(r.kind, 'decision', p);
+    assert.equal(r.gate, null, p);
+  }
+  // Regra do ADR: `?`/`;` não são removidos, então o token não é gate nem gate-like → conversa.
+  assert.deepEqual(kinds(perguntas), perguntas.map((p) => [p, 'none']));
+
+  // A pontuação permitida continua valendo.
+  for (const [p, gate] of [['APROVAR G1', 'G1'], ['APROVAR PROD.', 'PROD'], ['APROVAR G1!', 'G1'],
+    ['APROVAR G2,', 'G2'], ['APROVAR G3:', 'G3'], ['APROVAR G4…', 'G4']]) {
+    const r = classifyPrompt(p);
+    assert.equal(r.kind, 'decision', p);
+    assert.equal(r.gate, gate, p);
+  }
+});
+
 test('a classificação olha só a primeira linha', () => {
   assert.equal(classifyPrompt('APROVAR\nG1').kind, 'intent'); // gate na linha seguinte não vale
   assert.equal(classifyPrompt('resumo do dia\nAPROVAR G1').kind, 'none');

@@ -11,7 +11,11 @@ const APPROVE_VERBS = new Set(['aprovar', 'aprovo', 'aprovado']);
 const REJECT_VERBS = new Set(['reprovar', 'reprovo', 'rejeitar', 'rejeito']);
 
 // Pontuação final que não muda o sentido da linha ("APROVAR!", "APROVAR G1.").
-const TRAILING_PUNCT_RE = /[.!?:,;…]+$/;
+// Exatamente o conjunto do ADR-006, passo 2: `. ! : ,` e `…`. NÃO inclua `?` nem `;`:
+// "APROVAR G1?" é uma pergunta, e tratá-la como decisão gravaria uma aprovação
+// assinada contra a intenção do usuário. Com `?`/`;` colados, o token deixa de ser
+// gate (nem válido nem gate-like) e a linha cai em `none` (conversa).
+const TRAILING_PUNCT_RE = /[.!:,…]+$/;
 // Gate que o runtime aceita de fato.
 const VALID_GATE_RE = /^(g[1-4]|prod)$/i;
 // "Parece um gate" mas pode não existir (G9, GX, G0, prodX): intenção de decidir.

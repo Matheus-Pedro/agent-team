@@ -88,5 +88,38 @@ Todos os bloqueios de shell de `guard.test.mjs` continuam valendo (CA-03.6).
   - link simbólico ou junction apontando para dentro da árvore da chave não é detectado (comparação lexical);
   - o bloqueio por shell continua causando falso positivo quando o comando só cita o literal;
   - se uma ferramenta nova (MCP) fizer busca sem passar pelo matcher do hook, não é avaliada (B-15, v1.2).
-- O que fica mais difícil: liberar buscas por shell no futuro exigirá extrair o alvo do comando, ou seja, o
-  tokenizador do ADR-009 aplicado a `grep`/`rg`/`Select-String`.
+- O que fica mais difícil: liberar buscas por shell no futuro exigirá extrair o alvo do comando com um
+  tokenizador de shell **correto** — o do ADR-009 foi adiado para a v1.2 justamente por não ser.
+
+## Notas de implementação (revisão independente, 2026-09-17)
+Fonte: `.team/work/W-001-evolucao-v1-1/results/TR-code-reviewer.md` (conformidade e achado 3) e `decisions.md`.
+
+**(a) Regra 2 implementada numa forma mais restritiva que o texto — aceita.** O texto acima escreve
+`isInside(alvo, TEAM_HOME)`, que pela assinatura `isInside(parent, child)` significa "o alvo é **ancestral** do
+runtime" — e isso já está contido em `isSameOrAncestor(alvo, KEY_FILE)`, porque todo ancestral do runtime é
+ancestral da chave. O que a intenção do CA-03.3 pede ("um subdiretório dele") é o inverso: o alvo **dentro** do
+runtime. A implementação (`paths.mjs`, `reachesKey`) faz
+`isSameOrAncestor(alvo, KEY_FILE) || isSameOrAncestor(TEAM_HOME, alvo)`, ou seja, bloqueia também buscas em
+subdiretórios e arquivos do runtime instalado. O revisor confirmou que isso não abre nada. Leia a regra 2 como:
+**bloqueia se o alvo é a chave, um ancestral dela, o runtime instalado ou qualquer coisa dentro dele.** O Read
+continua restrito ao arquivo da chave (regra 1), então ler outros arquivos do runtime segue liberado (CA-03.4).
+
+**(b) Aliases de caminho — defesa em profundidade.** A comparação lexical da decisão não reconhece como o
+mesmo caminho: o prefixo de dispositivo `\\.\`, o compartilhamento administrativo (`\\localhost\c$\...`,
+inclusive na forma `\\?\UNC\...`) e nomes curtos 8.3 (o diretório do Claude tem nome 8.3 nesta máquina). Por
+isso, um Read da chave ou uma busca no runtime escritos com um alias passavam, o que era uma regressão em
+relação à v1.0, que bloqueava pelo texto. Decisão: além da ancestralidade, **bloquear quando o alvo normalizado
+contém o nome do arquivo da chave ou o segmento do runtime instalado**. Isso vale para Read (nome da chave) e
+Grep/Glob (os dois). É uma rede de segurança textual sobre o **alvo**, nunca sobre o padrão, então não
+reintroduz o B-03.
+
+**O que continua fora** (vai para "Limites" no README):
+- link simbólico e junction apontando para dentro da árvore da chave (comparação lexical, sem I/O);
+- **lacuna residual da defesa em profundidade:** um alias de um **ancestral** que não contenha o nome da chave
+  nem o segmento do runtime — por exemplo, o diretório do Claude escrito pelo nome 8.3, ou o perfil do usuário
+  escrito via `\\localhost\c$` — não é pego pela rede textual, e uma busca recursiva ali alcança a chave. Exige
+  evasão deliberada (o guard protege contra erro do modelo, não contra burla). Recomendação para fechar sem
+  custo relevante: normalizar estruturalmente `\\.\X:\`, `\\localhost\x$\` e `\\?\UNC\localhost\x$\` para `X:\`
+  (sem I/O) e, só quando algum segmento tiver a forma 8.3 (`~` seguido de dígito), expandir com
+  `fs.realpathSync.native` e **bloquear** se a expansão falhar. Cabe na v1.1 se a faixa A tiver folga; senão,
+  v1.2.

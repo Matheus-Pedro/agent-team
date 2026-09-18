@@ -7,7 +7,6 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { rules, core, startedProject, driveTo, tmpProject, editConfig, TEAM_HOME, REPO } from './helpers.mjs';
 
 const paths = await import('../runtime/lib/paths.mjs');
-const shell = await import('../runtime/lib/shell.mjs');
 
 const { evaluateToolCall, isStandaloneTeamCall, searchTargets, enforcementContext, classifyGitCommand } = rules;
 
@@ -221,7 +220,14 @@ test('CA-01.2 branch indeterminada bloqueia tudo que altera histórico', () => {
     assert.match(res.reason, /usuário/, c); // RNF-05: próximo passo
   }
   // `null` e BranchInfo explícito têm o mesmo efeito (normalizeBranchInfo)
-  assert.equal(unknown('git commit -m x', { kind: 'unknown', detail: 'git não encontrado no PATH' }).deny, true);
+  const exato = unknown('git commit -m x', { kind: 'unknown', detail: 'git não encontrado no PATH' });
+  assert.equal(exato.deny, true);
+  // texto exato: o próximo passo aparece uma vez só (achado 4 da revisão)
+  assert.equal(
+    exato.reason,
+    'Não foi possível identificar a branch atual (git não encontrado no PATH). Comandos que alteram histórico ' +
+      'ficam bloqueados até isso ser resolvido; peça ao usuário para verificar o repositório. O comando não foi executado.',
+  );
   // o que não altera histórico continua liberado
   assert.equal(unknown('git status').deny, false);
   assert.equal(unknown('git log --oneline').deny, false);
@@ -399,7 +405,8 @@ test('CA-05.2 erro interno fora de projeto com time é ignorado (exit 0)', () =>
   const payload = { hook_event_name: 'PreToolUse', cwd: dir, tool_name: 'Read', tool_input: { path: [] } };
   const res = runHook(payload);
   assert.equal(res.status, 0, res.stderr);
-  assert.match(res.stderr, /erro interno ignorado/);
+  assert.match(res.stderr, /erro interno/);
+  assert.equal(/BLOQUEADO/.test(res.stderr), false);
 });
 
 test('CA-05.3 entrada que não é JSON continua liberada', () => {
@@ -449,61 +456,202 @@ test('o guard continua bloqueando e liberando pelo hook (regressão do exit code
   assert.equal(liberado.status, 0, liberado.stderr);
 });
 
-// ---------------------------------------------------------------- US-07 (ADR-009)
+// ---------------------------------------------------------------- lista branca do CLI (US-07 retirada)
 
-test('CA-07.1 metacaractere dentro de aspas não invalida a chamada isolada', () => {
-  const ok = [
-    'node "$HOME/.claude/team/bin/team.mjs" move ARCHITECTING --reason "G1 ok; ajustar RF-02"',
-    'node "$HOME/.claude/team/bin/team.mjs" task add T1 --agent backend --title "API & regras"',
-    "node ~/.claude/team/bin/team.mjs move TESTING --reason 'a | b > c'",
-    'node "$HOME/.claude/team/bin/team.mjs" start --title "Evolução do runtime (v1.1)"',
-    "node ~/.claude/team/bin/team.mjs move TESTING --reason 'rm -rf .team é literal aqui'",
-  ];
-  for (const c of ok) assert.equal(isStandaloneTeamCall(c), true, c);
-
-  const root = startedProject();
-  for (const c of ok) assert.equal(bash(root, c).deny, false, c);
-});
-
-test('CA-07.3 composição fora das aspas continua bloqueada', () => {
-  const bad = [
-    'node "$HOME/.claude/team/bin/team.mjs" status && echo x > .team/state.json',
-    'node "$HOME/.claude/team/bin/team.mjs" status; rm -rf .team',
-    'node "$(echo pwn)/.claude/team/bin/team.mjs" status',
-    'node ~/.claude/team/bin/team.mjs status > /tmp/out',
-    'node ~/.claude/team/bin/team.mjs status | tee /tmp/out',
-    'node ~/.claude/team/bin/team.mjs move TESTING --reason "`whoami`"',
-    'node ~/.claude/team/bin/team.mjs move TESTING --reason "${IFS}"',
-    'node ~/.claude/team/bin/team.mjs move TESTING --reason "aspa não fechada',
-    'node ~/.claude/team/bin/team.mjs status\nrm -rf .team',
+/* A US-07 saiu da v1.1 (revisão, achado 2): metacaractere **em qualquer lugar**, dentro ou
+   fora de aspas, invalida a chamada isolada. Os três vetores abaixo foram executados pelo
+   revisor em powershell.exe e bash: o shell vê o `;` fora de aspas, um scanner de aspas não. */
+test('vetores de injeção da revisão são bloqueados (PowerShell \\", aspas tipográficas, bash $\'...\')', () => {
+  const vetores = [
+    // PowerShell: `\` não é escape, então `"a\"` fecha a string e o `;` executa
+    'node "$HOME/.claude/team/bin/team.mjs" move TESTING --reason "a\\" ; Remove-Item -Recurse -Force .team ; \\"b"',
+    // PowerShell: aspas tipográficas fecham a string aberta com `"`
+    'node "$HOME/.claude/team/bin/team.mjs" move TESTING --reason "a\u201c; Remove-Item -Recurse -Force .team; \u201cb"',
+    // bash: `$'x\''` é x' (ANSI-C), e o resto roda fora de aspas
+    "node ~/.claude/team/bin/team.mjs move TESTING --reason $'x\\'' ; rm -rf .team ; echo '",
   ];
   const root = startedProject();
-  for (const c of bad) {
+  for (const c of vetores) {
     assert.equal(isStandaloneTeamCall(c), false, c);
-    assert.equal(bash(root, c).deny, true, c);
+    const res = bash(root, c);
+    assert.equal(res.deny, true, c);
+    assert.match(res.reason, /nem mesmo entre aspas/);
   }
 });
 
-test('scanQuoting/unquotedMeta: contexto por aspas, escape e aspa não fechada', () => {
-  const { scanQuoting, unquotedMeta } = shell;
-  assert.equal(unquotedMeta('team status'), null);
-  assert.equal(unquotedMeta('a "b;c" d'), null);
-  assert.equal(unquotedMeta("a 'b;c|d' e"), null);
-  assert.equal(unquotedMeta('a "$HOME/x" b'), null); // $VAR simples é permitido
-  assert.equal(unquotedMeta('a; b'), ';');
-  assert.equal(unquotedMeta('a "b" && c'), '&');
-  assert.equal(unquotedMeta('a "$(b)"'), '$(');
-  assert.equal(unquotedMeta('a "`b`"'), '`');
-  assert.equal(unquotedMeta("a '$(b)'"), null);
-  assert.equal(unquotedMeta('a "b'), 'aspas não fechadas');
-  assert.equal(unquotedMeta("a 'b"), 'aspas não fechadas');
-  assert.equal(unquotedMeta('a\nb'), '\\n');
-  // `\"` é literal e não fecha a aspa: o `;` continua citado
-  assert.equal(unquotedMeta('a "b \\" c; d"'), null);
-  // barra invertida de caminho do Windows não é escape genérico
-  assert.equal(unquotedMeta('node "C:\\Users\\x\\team.mjs" status'), null);
-  assert.equal(unquotedMeta('C:\\bin\\x.exe & y'), '&');
-  const segs = scanQuoting('a "b" \'c\'');
-  assert.deepEqual(segs.map((s) => [s.text, s.quote]), [['a ', null], ['b', '"'], [' ', null], ['c', "'"]]);
-  assert.equal(segs.every((s) => s.closed), true);
+test('metacaractere entre aspas volta a invalidar a chamada isolada (regra estrita da v1.0)', () => {
+  const root = startedProject();
+  for (const c of [
+    'node "$HOME/.claude/team/bin/team.mjs" move ARCHITECTING --reason "G1 ok; ajustar RF-02"',
+    'node "$HOME/.claude/team/bin/team.mjs" task add T1 --agent backend --title "API & regras"',
+    "node ~/.claude/team/bin/team.mjs move TESTING --reason 'a | b'",
+    "node ~/.claude/team/bin/team.mjs move TESTING --reason 'a > b'",
+    'node ~/.claude/team/bin/team.mjs move TESTING --reason "`whoami`"',
+    'node ~/.claude/team/bin/team.mjs move TESTING --reason "$(whoami)"',
+    'node ~/.claude/team/bin/team.mjs status\nrm -rf .team',
+  ]) {
+    assert.equal(isStandaloneTeamCall(c), false, c);
+    assert.equal(bash(root, c).deny, true, c);
+  }
+  // sem metacaractere, inclusive com acento e $VAR, continua isolada
+  for (const c of [
+    'node "$HOME/.claude/team/bin/team.mjs" start --title "Evolução do runtime"',
+    "node ~/.claude/team/bin/team.mjs move TESTING --reason 'G1 ok, ajustar RF-02'",
+  ]) {
+    assert.equal(isStandaloneTeamCall(c), true, c);
+    assert.equal(bash(root, c).deny, false, c);
+  }
+  assert.equal(fs.existsSync(path.join(REPO, 'runtime', 'lib', 'shell.mjs')), false);
 });
+
+// ---------------------------------------------------------------- aliases de caminho (revisão, achado 3)
+
+const KEY_NAME = path.basename(KEY_FILE);
+const IS_WIN = process.platform === 'win32';
+
+/** Nome curto 8.3 real, pelo próprio Windows; devolve o mesmo caminho se o volume não gerar. */
+function shortName(p) {
+  try {
+    return execFileSync('cmd', ['/d', '/s', '/c', `"for %I in ("${p}") do @echo %~sI"`], {
+      encoding: 'utf8',
+      windowsVerbatimArguments: true,
+    }).trim();
+  } catch {
+    return p;
+  }
+}
+
+/** `C:\x\y` → `\\<host>\c$\x\y` */
+const adminShare = (p, host = 'localhost') => `\\\\${host}\\${p[0].toLowerCase()}$\\${p.slice(3)}`;
+
+test('aliases do revisor para a chave não escapam (\\\\.\\, admin share, \\\\?\\UNC\\, 8.3)', { skip: !IS_WIN }, () => {
+  const root = startedProject();
+  const aliases = [
+    `\\\\.\\${KEY_FILE}`,
+    adminShare(KEY_FILE),
+    `\\\\?\\UNC\\${adminShare(KEY_FILE).slice(2)}`,
+    adminShare(KEY_FILE, '127.0.0.1'),
+    adminShare(KEY_FILE, os.hostname()),
+    `//./${KEY_FILE.replace(/\\/g, '/')}`,
+  ];
+  const curto = shortName(TEAM_HOME);
+  if (curto !== TEAM_HOME) aliases.push(path.join(curto, KEY_NAME)); // runtime por nome 8.3 real
+  for (const alias of aliases) {
+    assert.equal(read(root, alias).deny, true, `Read ${alias}`);
+    const dir = path.dirname(alias);
+    assert.equal(search(root, 'Grep', { pattern: 'x', path: dir }).deny, true, `Grep ${dir}`);
+    assert.equal(search(root, 'Glob', { pattern: '**/*', path: dir }).deny, true, `Glob ${dir}`);
+  }
+  // alias de outro arquivo do runtime continua liberado no Read (CA-03.4)
+  assert.equal(read(root, adminShare(path.join(TEAM_HOME, 'bin', 'team.mjs'))).deny, false);
+});
+
+test('alias de um ANCESTRAL da chave (sem nome da chave nem do runtime) é bloqueado', { skip: !IS_WIN }, (t) => {
+  const root = startedProject();
+  // perfil do usuário via compartilhamento administrativo: ancestral da chave de teste (em %TEMP%)
+  const perfil = path.dirname(path.dirname(TEAM_HOME)); // ...\AppData\Local
+  assert.equal(search(root, 'Grep', { pattern: 'x', path: adminShare(perfil) }).deny, true, adminShare(perfil));
+  assert.equal(search(root, 'Glob', { pattern: '**/*', path: `\\\\?\\UNC\\${adminShare(perfil).slice(2)}` }).deny, true);
+
+  // ancestral por nome 8.3 real: runtime em <tmp>\Diretorio Longo Do Claude\team
+  const longo = fs.mkdtempSync(path.join(os.tmpdir(), 'at-8dot3-'));
+  const ancestral = path.join(longo, 'Diretorio Longo Do Claude');
+  fs.mkdirSync(path.join(ancestral, 'team'), { recursive: true });
+  const curto = shortName(ancestral);
+  const anterior = process.env.AGENT_TEAM_HOME;
+  process.env.AGENT_TEAM_HOME = path.join(ancestral, 'team'); // `paths.mjs` relê a variável
+  try {
+    assert.equal(search(root, 'Grep', { pattern: 'x', path: ancestral }).deny, true);
+    if (curto === ancestral) {
+      t.diagnostic('o volume do %TEMP% não gera nomes 8.3; a expansão real não foi exercitada aqui');
+    } else {
+      assert.match(path.basename(curto), /~\d/);
+      assert.equal(search(root, 'Grep', { pattern: 'x', path: curto }).deny, true, curto);
+      assert.equal(search(root, 'Glob', { pattern: '**/*', path: curto }).deny, true, curto);
+      assert.equal(paths.normalizeTarget(root, curto), ancestral); // expandido, não só o nome
+    }
+  } finally {
+    process.env.AGENT_TEAM_HOME = anterior;
+  }
+});
+
+test('nome 8.3 que não pode ser expandido bloqueia (fail-closed)', { skip: !IS_WIN }, () => {
+  const root = startedProject();
+  const inventado = path.join(os.tmpdir(), 'NAOEXIS~7', 'sub');
+  const res = search(root, 'Grep', { pattern: 'x', path: inventado });
+  assert.equal(res.deny, true);
+  assert.match(res.reason, /nome curto/);
+  assert.match(res.reason, /caminho completo/); // RNF-05: o que fazer
+  assert.equal(read(root, path.join(inventado, 'a.txt')).deny, true);
+  // nome com ~ e dígito que EXISTE de verdade é só um nome: expande para si mesmo e libera
+  const real = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'at-til-')), 'versao~2');
+  fs.mkdirSync(real);
+  assert.equal(search(root, 'Grep', { pattern: 'x', path: real }).deny, false);
+});
+
+test('defesa em profundidade: nome da chave ou do runtime (.claude/team, CLAUDE~N) no alvo nega', () => {
+  const root = startedProject();
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'at-alias-'));
+  fs.mkdirSync(path.join(base, 'qualquer', '.claude', 'team', 'lib'), { recursive: true });
+  // Read: qualquer arquivo com o nome da chave; outro arquivo com nome de runtime continua liberado
+  assert.equal(read(root, path.join(base, 'qualquer', KEY_NAME)).deny, true);
+  assert.equal(read(root, path.join(base, 'qualquer', '.claude', 'team', 'bin.mjs')).deny, false);
+  // Grep/Glob: alvo com nome do runtime instalado
+  for (const alvo of [
+    path.join(base, 'qualquer', '.claude', 'team'),
+    path.join(base, 'qualquer', '.claude', 'team', 'lib'),
+  ]) {
+    assert.equal(search(root, 'Grep', { pattern: 'x', path: alvo }).deny, true, alvo);
+  }
+  assert.equal(paths.isRuntimeAlias(path.join(base, 'CLAUDE~2', 'team')), true);
+  assert.equal(paths.isRuntimeAlias(path.join(base, 'CLAUDE~2')), true);
+  assert.equal(paths.isRuntimeAlias(path.join(base, 'qualquer')), false);
+  // o texto do padrão continua fora da avaliação
+  assert.equal(search(root, 'Grep', { pattern: `CLAUDE~2/team/${KEY_NAME}`, path: root }).deny, false);
+  // a normalização em si
+  assert.equal(paths.stripLongPrefix('\\\\.\\C:\\x'), 'C:\\x');
+  assert.equal(paths.stripLongPrefix('\\\\.\\UNC\\srv\\share\\x'), '\\\\srv\\share\\x');
+  assert.equal(paths.stripAdminShare('\\\\localhost\\c$\\Users\\x'), 'C:\\Users\\x');
+  assert.equal(paths.stripAdminShare('\\\\LOCALHOST\\D$'), 'D:\\');
+  assert.equal(paths.stripAdminShare('\\\\outro-servidor\\c$\\x'), '\\\\outro-servidor\\c$\\x');
+});
+
+// ---------------------------------------------------------------- import das regras dentro do fail-closed (achado 7)
+
+/** Cópia do runtime num temporário, com um módulo danificado; o repositório não é tocado. */
+function brokenRuntime(damage) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-team-runtime-'));
+  fs.cpSync(path.join(REPO, 'runtime'), dir, { recursive: true });
+  damage(dir);
+  return path.join(dir, 'hooks', 'guard.mjs');
+}
+const runHookAt = (hook, payload) =>
+  spawnSync(process.execPath, [hook], { input: JSON.stringify(payload), encoding: 'utf8', env: process.env });
+
+test('módulo ausente ou com erro de sintaxe: bloqueia com time ativo, libera fora', () => {
+  const root = startedProject();
+  const dentro = { hook_event_name: 'PreToolUse', cwd: root, tool_name: 'Bash', tool_input: { command: 'npm test' } };
+  const fora = { ...dentro, cwd: tmpProject() };
+  const casos = {
+    'paths.mjs ausente': (d) => fs.rmSync(path.join(d, 'lib', 'paths.mjs')),
+    'git.mjs com erro de sintaxe': (d) => fs.writeFileSync(path.join(d, 'lib', 'git.mjs'), 'export const = ;\n'),
+    'guard-rules.mjs ausente': (d) => fs.rmSync(path.join(d, 'lib', 'guard-rules.mjs')),
+  };
+  for (const [nome, damage] of Object.entries(casos)) {
+    const hook = brokenRuntime(damage);
+    const res = runHookAt(hook, dentro);
+    assert.equal(res.status, 2, `${nome}: ${res.stderr}`);
+    assert.match(res.stderr, /^\[agent-team\] BLOQUEADO: erro interno do guard ao avaliar Bash/, nome);
+    assert.match(res.stderr, /enforce: false/, nome);
+    assert.equal(/\n\s+at /.test(res.stderr), false, nome);
+    assert.equal(runHookAt(hook, fora).status, 0, `${nome} (fora)`);
+    editConfig(root, (c) => {
+      c.enforce = false;
+    });
+    assert.equal(runHookAt(hook, dentro).status, 0, `${nome} (enforce=false)`);
+    editConfig(root, (c) => {
+      c.enforce = true;
+    });
+  }
+});
+

@@ -46,7 +46,7 @@ function runGit(cwd, args) {
       encoding: 'utf8',
       timeout: GIT_TIMEOUT_MS,
       stdio: ['ignore', 'pipe', 'ignore'],
-      windowsHide: true,
+      // Sem `windowsHide`: fora do contrato §1 e custa ~10 ms por spawn no Windows (RNF-03).
     });
     return { status: 0, stdout: String(stdout ?? '') };
   } catch (err) {

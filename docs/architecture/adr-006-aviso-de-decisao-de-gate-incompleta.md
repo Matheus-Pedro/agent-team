@@ -80,3 +80,7 @@ mensagem de hoje (CA-08.8).
   aprovação") espera `stdout` vazio para a mensagem `'aprovado'`. O CA-08.1 exige aviso para `APROVADO`
   isolado, em qualquer caixa. Esse caso sai da lista de silêncio e vira caso de aviso; os outros três da lista
   continuam como estão.
+
+**Pendência conhecida (v1.2):** os avisos normativos acima estão na segunda pessoa ("Você digitou...", "Digite
+exatamente..."), mas quem os lê é o agente, não o usuário — a mesma falha já corrigida nas frases do ADR-001.
+Sem efeito de segurança; adiado pelo Orchestrator na revisão de 2026-09-17 (achado 6 de `TR-code-reviewer.md`).

@@ -72,9 +72,10 @@ Para responder a um gate, a primeira linha da sua mensagem deve ser exatamente o
 | Você digita | Efeito |
 |---|---|
 | `APROVAR G1` · `G2` · `G3` · `G4` · `PROD` | registra a aprovação assinada; linhas seguintes viram observações |
-| `REPROVAR G2 <motivo>` | registra a reprovação; o Orchestrator volta à fase com o motivo |
+| `REPROVAR G2 <motivo>` (ou `REPROVAR G2: <motivo>`, `REPROVAR G2, <motivo>`) | registra a reprovação; o Orchestrator volta à fase com o motivo |
 | `APROVAR` (sem gate), `APROVADO`, `APROVAR G9`, `REPROVAR` | **nada é registrado**; com work item ativo, você recebe um aviso com o gate que está aguardando e o comando exato a digitar |
 | `ok`, `pode seguir`, 👍 | **não é aprovação** (e não gera aviso) |
+| `APROVAR G1?`, `APROVAR G1;`, `REPROVAR G1; <motivo>` | **conversa**: nada é registrado e não há aviso. No fim da linha, só `. ! : ,` e `…` são aceitos |
 
 Vale a **última** decisão: se você aprovar e depois reprovar o mesmo gate antes de o fluxo avançar, a aprovação deixa de valer (e vice-versa).
 
@@ -187,7 +188,6 @@ Com a v1.1, um erro interno do guard **bloqueia** a ação num projeto com time 
 
 Outras regras do guard:
 - **Buscas são avaliadas pelo alvo, não pelo texto do padrão.** Um Grep ou Glob no projeto pode procurar qualquer texto, inclusive `approval.key`, `.claude/team` ou `.team/state.json`. No shell, citar esses nomes continua bloqueado, e a mensagem indica usar Grep, Glob ou Read.
-- **Metacaracteres dentro de aspas** (`; & | < >`) não impedem uma chamada isolada do CLI `team`, por exemplo `--reason "G1 ok; ajustar RF-02"`. Fora de aspas, `;`, `&&`, `|`, redirecionamento e `$( )` continuam bloqueados. Dentro de aspas duplas, `` ` ``, `$(` e `${` também continuam bloqueados.
 - **Fail-closed escopado:** se o guard tiver um erro interno num projeto com time ativo (`enforce` diferente de `false`), a ação é bloqueada, com `[agent-team] BLOQUEADO: erro interno do guard ...`. Fora de projetos com time, ou com `enforce: false`, o erro vai para o stderr e a ação passa. A saída para um guard quebrado está em [Se o guard travar o projeto](#se-o-guard-travar-o-projeto).
 
 O log de auditoria fica em `.team/logs/orchestration.jsonl`, com o `actor` (`user` ou `orchestrator`) de cada evento.
@@ -201,9 +201,12 @@ O log de auditoria fica em `.team/logs/orchestration.jsonl`, com o `actor` (`use
 - **Projetos no WSL** (`\\wsl.localhost\...`): se a sessão do Claude Code rodar *dentro* do WSL, `~/.claude` é o do Linux. Nesse caso, instale lá também (`node scripts/install.mjs` executado no WSL, com Node instalado).
 - **Caminhos UNC** (`\\servidor\share`, `\\wsl.localhost\...`) não foram testados com um share real. Se o git falhar nesse caminho, a branch conta como não identificada e o guard bloqueia comandos que alteram histórico.
 - **Buscas pelo alvo são comparações de caminho, sem acessar o disco.** Um link simbólico ou junction que aponte para a árvore da chave não é detectado. O prefixo longo do Windows (`\\?\C:\...`) é removido antes da comparação ([ADR-003](docs/architecture/adr-003-buscas-avaliadas-pelo-alvo.md)).
+- **Outras formas de escrever o mesmo caminho não são normalizadas:** nomes curtos 8.3 do Windows (como `CLAUDE~1`) e caminhos UNC administrativos (`\\localhost\c$\...`, `\\.\C:\...`). Para esses casos, o guard usa defesa em profundidade: bloqueia pelo nome do arquivo da chave e pelo trecho do caminho do runtime instalado, em vez de reconhecer o caminho completo.
+- **Um `--claude-dir` em qualquer lugar da linha de comando** rebaixa a instalação de produção (PROD) para deploy de teste (G4). O comando continua exigindo `DEPLOYING` com G4.
 - **Buscas com alvo em `~` ou `~/.claude` agora são bloqueadas**, mesmo quando o objetivo é legítimo (por exemplo, procurar a config do Claude Code), porque esses diretórios contêm a chave. Restrinja o alvo a um subdiretório que não a contenha.
 - **Instalação como deploy** depende de padrões de texto ([ADR-002](docs/architecture/adr-002-instalacao-como-deploy-e-producao.md)): um caminho com espaços (`node "C:/meus projetos/scripts/install.mjs"`) não casa com o padrão, e copiar o runtime à mão também não. A escrita direta no runtime instalado continua bloqueada. Em outros projetos, um `scripts/install.mjs` executado via `node` também é classificado como deploy (falso positivo); ajuste `deploy.patterns` se for o caso. `--dry-run` do instalador também é bloqueado fora de `DEPLOYING`.
 - **`APROVAR G1 <texto extra>` na mesma linha não registra nada e não gera aviso**, porque a linha é tratada como conversa ([ADR-006](docs/architecture/adr-006-aviso-de-decisao-de-gate-incompleta.md)). Coloque observações nas linhas seguintes.
+- **Linhas terminadas em `?` ou `;` também são conversa:** `APROVAR G1?`, `APROVAR G1;` e `APROVAR?` não registram nada **e não geram aviso**, para que uma pergunta nunca vire aprovação. Pelo mesmo motivo, `REPROVAR G1; motivo` não registra a reprovação (na v1.0, registrava). Use `REPROVAR G1: motivo`, `REPROVAR G1, motivo` ou `REPROVAR G1 motivo`.
 - **Desenvolvimento do próprio agent-team** ([ADR-010](docs/architecture/adr-010-seguranca-do-dogfooding-neste-repositorio.md)): o código do runtime em desenvolvimento usa o `.team/` e a chave reais se for executado diretamente. Neste repositório, a config bloqueia `node runtime/bin/team.mjs` e `node runtime/hooks/*.mjs`, mas **não** cobre `node -e` nem um script que importe a lib. Exercite o runtime só pelos testes (`npm test`), que usam `AGENT_TEAM_HOME` e projeto temporários. A solução estrutural fica para a v2.
 - **Guard quebrado bloqueia:** como o erro interno agora bloqueia a ação (fail-closed), um bug determinístico no runtime instalado pode parar o projeto até você usar `enforce: false`.
 
@@ -222,7 +225,6 @@ runtime/
   lib/guard-rules.mjs           regras do guard
   lib/git.mjs                   branch atual e commit base (único ponto que executa git)
   lib/paths.mjs                 comparação de caminhos (alvo das buscas)
-  lib/shell.mjs                 aspas e metacaracteres de linha de comando
   lib/prompt-rules.mjs          reconhecimento de APROVAR/REPROVAR
 scripts/                        build, install, uninstall
 tests/                          node:test (runtime, hooks, instalação)

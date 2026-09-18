@@ -63,3 +63,26 @@ passa por esse caminho, e a mensagem é montada só a partir de `err.name`/`err.
   saída (o usuário desliga `enforce`), o que precisa aparecer no README.
 - O que fica mais difícil: qualquer regra nova precisa ser defensiva por conta própria — o "vai passar mesmo se
   eu errar" deixou de existir.
+
+## Nota de implementação (revisão independente, 2026-09-17)
+Fonte: `.team/work/W-001-evolucao-v1-1/results/TR-code-reviewer.md` (achado 7) e `decisions.md`.
+
+**Lacuna encontrada:** a sequência da decisão protegia só as exceções **de avaliação**. Os módulos de regra eram
+carregados por `import` estático no topo de `hooks/guard.mjs`; se um deles faltasse (instalação parcial) ou
+tivesse erro de sintaxe, o Node falhava antes de qualquer `try`, saía com código 1, e o harness trata código
+diferente de 2 como **não bloqueante**. Resultado: fail-open com time ativo, exatamente o B-06 por outra porta.
+
+**Correção (coerente com esta decisão, sem mudar o que foi aprovado):**
+1. `hooks/guard.mjs` passa a ter **apenas imports de `node:fs` e `node:path`** no topo.
+2. Antes de carregar qualquer regra, descobre se há time ativo **só com `fs`/`path`**: sobe a partir do `cwd`
+   (e do diretório do alvo, quando houver) procurando `.team/config.json`; lê o JSON; `enforce === false` ⇒ não
+   ativo; JSON ilegível ⇒ ativo (mesma regra do passo 2 acima). Essa descoberta duplica de propósito a lógica de
+   `findTeamRoot`/`loadConfig`, porque não pode depender dos módulos cuja carga ela está protegendo.
+3. As regras são carregadas com `await import()` **dentro** do `try` que já cobria a avaliação. Falha de import
+   passa a seguir a mesma tabela: time ativo ⇒ `exit 2` com a mensagem de erro interno; sem time ⇒ `exit 0` e
+   stderr.
+4. Se a própria descoberta do passo 2 lançar, vale a regra já decidida: não se sabe se há time ⇒ `exit 0` +
+   stderr.
+
+Consequência adicional: uma instalação parcial do runtime agora **trava** os projetos com time ativo até ser
+refeita — é o comportamento correto e deve estar no README junto com a saída `enforce: false`.

@@ -1,5 +1,10 @@
 # ADR-009 — Metacaracteres dentro de aspas não invalidam a chamada isolada do CLI
-Status: Aceito no G2 em 2026-09-17 · Data: 2026-09-17 · Work item: W-001-evolucao-v1-1
+Status: Adiado para a v1.2 (aceito no G2 em 2026-09-17; retirado da v1.1 na revisão de 2026-09-17) · Data: 2026-09-17 · Work item: W-001-evolucao-v1-1
+
+> **Este ADR não vale na v1.1.** A regra de aspas descrita abaixo mostrou-se insegura na revisão independente
+> e a US-07 (NICE_TO_HAVE) saiu do escopo. `isStandaloneTeamCall` segue a regra estrita da v1.0: qualquer
+> metacaractere, em qualquer posição, inclusive entre aspas, invalida a chamada isolada. O texto original fica
+> preservado como registro; veja **"Por que foi adiado"** no fim.
 
 ## Contexto
 US-07 (NICE_TO_HAVE), RF-12, B-09. `isStandaloneTeamCall` (`guard-rules.mjs:27-29`) exige que o comando case
@@ -38,7 +43,7 @@ Regras por contexto, pensadas para valer nos dois shells de referência (Git Bas
 | dentro de `"..."` | `` ` ``, `$(`, `${` — PowerShell **e** POSIX expandem subexpressão dentro de aspas duplas | `; & \| < >`, acentos, `$VAR` simples |
 | dentro de `'...'` | nada | tudo (literal em POSIX e em PowerShell) |
 | aspas não fechadas | o comando **não** é chamada isolada | — |
-| escape `\"` fora e dentro de aspas duplas | tratado como caractere literal, não fecha a aspa | — |
+| escape `\"` fora e dentro de aspas duplas | tratado como caractere literal, não fecha a aspa | — ⚠️ **linha incorreta**: é a origem da falha; ver "Por que foi adiado" |
 
 `isStandaloneTeamCall(command)` passa a ser `TEAM_CLI_RE.test(slash(command)) && unquotedMeta(command) === null`.
 Nada mais muda: a função é uma **lista branca** consultada no início de `evaluateToolCall` (`:146`), então
@@ -64,3 +69,40 @@ os arquivos são escritos em UTF-8. É verificação do QA nos dois shells, não
   bloqueados (CA-07.3) e acrescentar: metacaractere dentro de aspas simples e duplas liberado, `$(` dentro de
   aspas duplas bloqueado, aspa não fechada rejeitada.
 - É NICE_TO_HAVE: sai do ciclo sem afetar as demais tarefas, desde que a nota do SKILL.md continue em pé.
+
+## Por que foi adiado
+Revisão independente de 2026-09-17 (`.team/work/W-001-evolucao-v1-1/results/TR-code-reviewer.md`, achado 2,
+BLOCKER), decisão do Orchestrator registrada em `decisions.md` ("Revisão: MUDANÇAS NECESSÁRIAS").
+
+**O que falhou.** O revisor demonstrou, executando em `powershell.exe` e em `bash`, comandos em que o scanner
+concluía que um trecho estava entre aspas enquanto o shell real concluía que não estava. Nesses casos
+`isStandaloneTeamCall` devolvia `true`, e como ela é consultada **antes** de qualquer regra de negação, o guard
+liberava o comando inteiro, inclusive um segundo comando encadeado. A causa está na **regra**, não só no código:
+a tabela deste ADR tratava o escape de aspa dupla com barra invertida como literal nos dois shells, e isso não é
+verdade para o PowerShell; e a tabela não previa formas de citação que só um dos shells reconhece.
+
+**O erro de raciocínio.** A seção "Consequências" afirmava que a mudança era *fail-closed por construção*,
+porque um caso não previsto faria o comando ser rejeitado da lista branca. Isso só vale quando o scanner erra
+para o lado de "não está entre aspas". Um scanner que erra para o lado de "está entre aspas" **esconde**
+metacaracteres reais, e o resultado é fail-open. Em uma lista branca, qualquer divergência entre o parser e o
+shell é explorável; a premissa deveria ter sido o contrário.
+
+**O que uma próxima tentativa precisa resolver** (pré-requisitos, não solução):
+1. **Um modelo de citação por shell, não um modelo comum.** PowerShell e bash divergem no caractere de escape,
+   no significado da barra invertida dentro e fora de aspas, em formas de citação exclusivas de cada um e no
+   tratamento de argumentos passados a executáveis nativos. A regra precisa saber qual shell vai executar (o
+   harness informa a ferramenta: `Bash` ou `PowerShell`) e ser especificada separadamente para cada um.
+2. **Escapes.** Toda sequência de escape reconhecida por **qualquer** dos dois shells tem de ser tratada de modo
+   conservador: na dúvida, o texto é considerado **fora** de aspas.
+3. **Aspas não ASCII.** O PowerShell aceita aspas tipográficas como delimitadores; qualquer caractere que algum
+   shell trate como aspa precisa entrar no modelo, ou o comando que o contiver deve ser rejeitado.
+4. **Direção do erro explícita.** O critério de aceite tem de ser "nenhuma entrada em que o scanner vê aspas e o
+   shell não vê", verificado com execução real nos dois shells (como fez o revisor), e não só com testes de
+   unidade sobre o scanner.
+5. **Alternativa a considerar primeiro:** a opção 4 deste ADR (motivo e título por arquivo ou stdin) elimina o
+   problema em vez de modelá-lo, e provavelmente é mais barata que um parser de shell correto.
+
+Efeitos na v1.1: `runtime/lib/shell.mjs` deixa de ser usado pelo guard (removê-lo ou mantê-lo sem uso é decisão
+da faixa A; ele não pode continuar no caminho de decisão); o teste que afirmava o caso inseguro
+(`tests/guard.test.mjs`, apontado pelo revisor) tem de ser removido ou invertido para exigir bloqueio; a instrução do `SKILL.md` que manda evitar `; & | > <` em motivos e títulos **continua valendo**; o
+CA-07.2 (acentos) não dependia deste ADR.

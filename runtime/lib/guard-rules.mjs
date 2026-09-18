@@ -21,8 +21,16 @@ import {
   missingBaseCommitMessage,
   unknownBranchMessage,
 } from './git.mjs';
-import { normalizeTarget, patternTarget, samePath, reachesKey, keyFilePath } from './paths.mjs';
-import { unquotedMeta } from './shell.mjs';
+import {
+  normalizeTarget,
+  patternTarget,
+  samePath,
+  reachesKey,
+  keyFilePath,
+  isKeyAlias,
+  isRuntimeAlias,
+  isUnresolvedAlias,
+} from './paths.mjs';
 
 const FILE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
 const SHELL_TOOLS = new Set(['Bash', 'PowerShell']);
@@ -34,12 +42,15 @@ const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const TEAM_CLI_RE =
   /^\s*node(?:\.exe)?\s+(?:"[^"]*\.claude\/team\/bin\/team\.mjs"|'[^']*\.claude\/team\/bin\/team\.mjs'|[^\s"']*\.claude\/team\/bin\/team\.mjs)(?:\s|$)/i;
 
-/**
- * Lista branca do CLI do time. Metacaractere **dentro de aspas** não invalida a
- * chamada (ADR-009): `--reason "G1 ok; ajustar RF-02"` é uma chamada isolada.
- */
+// Regra estrita da v1.0: qualquer metacaractere de shell, **dentro ou fora de aspas**,
+// invalida a chamada isolada. A US-07 (aspas liberando metacaractere, ADR-009) saiu da
+// v1.1: as regras de citação divergem entre PowerShell e bash (`\"`, aspas tipográficas,
+// `$'...'`), e um scanner que erre para o lado permissivo libera o comando inteiro.
+const SHELL_META_RE = /[;&|<>`\r\n]|\$\(/;
+
+/** Lista branca do CLI do time: só a chamada isolada, sem nenhum metacaractere. */
 export function isStandaloneTeamCall(command) {
-  return TEAM_CLI_RE.test(slash(command)) && unquotedMeta(command) === null;
+  return TEAM_CLI_RE.test(slash(command)) && !SHELL_META_RE.test(command);
 }
 
 export function protectedFileReason(filePath, cwd) {
@@ -71,7 +82,7 @@ export function shellPathReason(command) {
   if (/\.claude\/team(\/|\b)/.test(n)) {
     return (
       'o runtime do time só pode ser usado como comando isolado: node "$HOME/.claude/team/bin/team.mjs" <args> ' +
-      '(sem ;, &&, |, >, $( ) fora de aspas). Para ler ou pesquisar o código do runtime, use Read, Grep ou Glob ' +
+      '(sem ;, &, |, <, >, `, $( nem quebra de linha, nem mesmo entre aspas). Para ler ou pesquisar o código do runtime, use Read, Grep ou Glob ' +
       '(o alvo não pode ser o diretório do runtime instalado).'
     );
   }
@@ -153,22 +164,37 @@ export function detectDeploy(command, deployCfg) {
  * @returns {string[]} caminhos absolutos normalizados
  */
 export function searchTargets(toolName, toolInput = {}, cwd) {
-  const add = (t) => (t ? [t] : []);
+  return searchTargetEntries(toolName, toolInput, cwd).map((e) => e.target);
+}
+
+/**
+ * Como `searchTargets`, marcando o alvo que vem do prefixo de uma **regex** (`pattern`
+ * do Grep). Esse alvo passa só pela comparação estrutural: a rede por nome
+ * (`isKeyAlias`/`isRuntimeAlias`) nele seria falso positivo — no Windows a regex
+ * `\.claude/team` vira o "caminho" `C:\.claude\team`.
+ */
+function searchTargetEntries(toolName, toolInput = {}, cwd) {
+  const entries = [];
+  const add = (target, fromRegex = false) => {
+    if (target) entries.push({ target, fromRegex });
+  };
   if (toolName === 'Read') {
-    return add(normalizeTarget(cwd, toolInput.file_path || toolInput.notebook_path || toolInput.path));
+    add(normalizeTarget(cwd, toolInput.file_path || toolInput.notebook_path || toolInput.path));
+    return entries;
   }
-  if (!SEARCH_TOOLS.has(toolName)) return [];
-  const targets = [
-    ...add(normalizeTarget(cwd, toolInput.path || cwd)),
-    ...add(patternTarget(cwd, toolInput.pattern)),
-  ];
-  if (toolName === 'Grep') targets.push(...add(patternTarget(cwd, toolInput.glob)));
-  return targets;
+  if (!SEARCH_TOOLS.has(toolName)) return entries;
+  add(normalizeTarget(cwd, toolInput.path || cwd));
+  add(patternTarget(cwd, toolInput.pattern), toolName === 'Grep');
+  if (toolName === 'Grep') add(patternTarget(cwd, toolInput.glob));
+  return entries;
 }
 
 const SEARCH_TARGET_REASON =
   'busca cujo alvo alcança a chave de assinatura das aprovações não é permitida; ' +
   'restrinja o alvo ao diretório do projeto (o padrão da busca pode citar qualquer texto).';
+const UNRESOLVED_ALIAS_REASON =
+  'o alvo usa um nome curto do Windows (8.3, com ~ e dígito) que não pôde ser resolvido, então não dá para saber se ele ' +
+  'alcança a chave de assinatura das aprovações. Repita a chamada com o caminho completo, sem nomes curtos.';
 const KEY_READ_REASON =
   'a chave de assinatura das aprovações não pode ser lida; ela nunca é necessária para o trabalho. ' +
   'Para conferir uma aprovação, use `team status`; para pesquisar o código, use Grep ou Glob no projeto.';
@@ -234,14 +260,17 @@ export function evaluateToolCall(input, deps = {}) {
   if (toolName === 'Read') {
     const key = keyFilePath();
     for (const target of searchTargets('Read', toolInput, cwd)) {
-      if (samePath(target, key)) return deny(KEY_READ_REASON);
+      if (isUnresolvedAlias(target)) return deny(UNRESOLVED_ALIAS_REASON);
+      if (samePath(target, key) || isKeyAlias(target)) return deny(KEY_READ_REASON);
     }
     return allow;
   }
 
   if (SEARCH_TOOLS.has(toolName)) {
-    for (const target of searchTargets(toolName, toolInput, cwd)) {
+    for (const { target, fromRegex } of searchTargetEntries(toolName, toolInput, cwd)) {
+      if (isUnresolvedAlias(target)) return deny(UNRESOLVED_ALIAS_REASON);
       if (reachesKey(target)) return deny(SEARCH_TARGET_REASON);
+      if (!fromRegex && (isKeyAlias(target) || isRuntimeAlias(target))) return deny(SEARCH_TARGET_REASON);
     }
     return allow;
   }
@@ -269,10 +298,8 @@ export function evaluateToolCall(input, deps = {}) {
       const branch = normalizeBranchInfo((deps.getBranch || resolveBranch)(cwd));
       // Branch indeterminada: nada que altere histórico passa (CA-01.2, RNF-04).
       if (branch.kind === 'unknown') {
-        return deny(
-          `${unknownBranchMessage(branch.detail)} Peça ao usuário para verificar o repositório ` +
-            'e informe que o comando não foi executado.',
-        );
+        // `unknownBranchMessage` já traz o próximo passo (pedir ao usuário para verificar).
+        return deny(`${unknownBranchMessage(branch.detail)} O comando não foi executado.`);
       }
       // `no-repo` e `detached` não são a principal (CA-01.7, comportamento da v1.0).
       const onMain = action.targetsMain || (branch.kind === 'branch' && mains.includes(branch.name));

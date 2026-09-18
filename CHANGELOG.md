@@ -8,6 +8,8 @@ O formato segue o [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/), e
 
 Work item `W-001-evolucao-v1-1`, o primeiro feito com o próprio agent-team. Requisitos em [`docs/requirements/W-001-evolucao-v1-1.md`](docs/requirements/W-001-evolucao-v1-1.md) e decisões nos ADRs 001 a 010 de [`docs/architecture/`](docs/architecture/).
 
+A US-07 (títulos e motivos com metacaracteres entre aspas) foi adiada para a 1.2.0 por um problema de segurança encontrado na revisão. A chamada do CLI `team` continua recusando esses caracteres em qualquer lugar do comando, como na 1.0.0.
+
 ### Atualização a partir da 1.0.0 (leia antes de instalar)
 
 - **Projetos que já têm `.team/` não recebem as proteções novas da config sozinhos.** A config do projeto substitui os padrões do código, então a proteção contra instalar ou remover o agent-team (US-02) e a trilha P mais leve (US-06) só valem em projetos criados com `team init` na 1.1.0. Nos projetos existentes, acrescente os padrões ao `.team/config.json`, no seu editor, conforme o README ([Projetos que já têm `.team/`](README.md#projetos-que-já-têm-team-atualização-da-v10)).
@@ -26,7 +28,7 @@ Work item `W-001-evolucao-v1-1`, o primeiro feito com o próprio agent-team. Req
 - **US-03 — Buscas avaliadas pelo alvo.** Grep e Glob no projeto podem procurar qualquer texto, inclusive `approval.key`, `.claude/team` e `.team/state.json`, que antes bloqueavam a busca. Em compensação, uma busca cujo alvo alcance a chave de assinatura (o arquivo, o runtime instalado ou um diretório acima, como `~/.claude` e `~`) passa a ser bloqueada. No shell, citar esses nomes continua bloqueado, e a mensagem agora indica usar Grep, Glob ou Read.
 - **US-05 — O guard bloqueia quando falha.** Num projeto com time ativo, um erro interno do guard bloqueia a ação com `[agent-team] BLOQUEADO: erro interno do guard ...`, em vez de liberá-la sem aviso. Fora de projetos com time, ou com `enforce: false`, o comportamento é o da 1.0.0.
 - **US-06 — Trilha P mais leve.** Projetos novos nascem com G1 e G2 desligados na trilha P. G3, G4 e PROD continuam valendo. As trilhas M e G não mudam.
-- **US-07 — Títulos e motivos com qualquer caractere.** Uma chamada isolada do CLI `team` aceita `; & | < >` e acentos dentro de aspas, por exemplo `--reason "G1 ok; ajustar RF-02"`. Fora de aspas, comandos compostos continuam bloqueados.
+- **Decisões de gate terminadas em `?` ou `;` são conversa.** `APROVAR G1?` e `APROVAR G1;` não registram nada e não geram aviso: só `. ! : ,` e `…` no fim da linha são aceitos. Por isso, `REPROVAR G1; motivo` deixou de registrar a reprovação, o que a 1.0.0 fazia. Use `REPROVAR G1: motivo`, `REPROVAR G1, motivo` ou `REPROVAR G1 motivo`.
 - As mensagens de bloqueio novas (commit base, branch não identificada, busca e erro interno) dizem o que fazer a seguir.
 
 ### Fixed

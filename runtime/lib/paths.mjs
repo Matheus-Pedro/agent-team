@@ -4,30 +4,102 @@
 //   1. usa `node:path` **da plataforma** (nunca `path.posix`, nunca `toLowerCase`
 //      manual): é `path.relative` que dá a semântica de caixa correta em cada
 //      sistema (no Windows compara sem diferenciar caixa; no POSIX diferencia);
-//   2. é puramente lexical — nenhuma chamada de `fs`. Custo próximo de zero no
-//      caminho comum (RNF-03), mas link simbólico e junction **não** são
-//      resolvidos (limite registrado no ADR-003).
+//   2. é lexical no caminho comum — nenhuma chamada de `fs`, custo próximo de zero
+//      (RNF-03). A única exceção é o nome curto 8.3 do Windows (`CLAUDE~2`), que só
+//      o sistema de arquivos sabe expandir: aí, e só aí, há um `realpath`.
+//      Link simbólico e junction **não** são resolvidos (limite do ADR-003).
+//
+// Aliases do mesmo arquivo no Windows tratados aqui: `\\?\`, `\\.\`, `\\?\UNC\`,
+// `\\.\UNC\`, compartilhamento administrativo local (`\\localhost\c$\...`) e 8.3.
+// Defesa em profundidade: `isKeyAlias`/`isRuntimeAlias` negam pelo **nome** no alvo
+// normalizado, para o caso de sobrar um alias que a normalização não conheça.
 
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { TEAM_HOME, KEY_FILE } from './core.mjs';
 
-/** Remove o prefixo longo do Windows: `\\?\C:\x` → `C:\x`, `\\?\UNC\srv\share` → `\\srv\share`. */
+const DEVICE_PREFIX_RE = /^[\\/]{2}[?.][\\/]/; // \\?\ e \\.\ (também com /)
+const UNC_AFTER_PREFIX_RE = /^UNC[\\/]/i;
+
+/**
+ * Remove o prefixo de dispositivo do Windows: `\\?\C:\x` e `\\.\C:\x` → `C:\x`;
+ * `\\?\UNC\srv\share` e `\\.\UNC\srv\share` → `\\srv\share`.
+ */
 export function stripLongPrefix(p) {
   const s = String(p ?? '');
-  if (!s.startsWith('\\\\?\\')) return s;
+  if (!DEVICE_PREFIX_RE.test(s)) return s;
   const rest = s.slice(4);
-  return /^UNC\\/i.test(rest) ? `\\\\${rest.slice(4)}` : rest;
+  return UNC_AFTER_PREFIX_RE.test(rest) ? `\\\\${rest.slice(4)}` : rest;
 }
+
+let localHosts;
+function isLocalHost(host) {
+  if (!localHosts) {
+    localHosts = new Set(['localhost', '127.0.0.1', '::1', '[::1]', '0--1.ipv6-literal.net', '.']);
+    try {
+      localHosts.add(os.hostname().toLowerCase());
+    } catch {
+      /* sem hostname: fica só com os literais */
+    }
+  }
+  return localHosts.has(String(host).toLowerCase());
+}
+
+/** `\\localhost\c$\Users\x` → `C:\Users\x` (compartilhamento administrativo da própria máquina). */
+export function stripAdminShare(p) {
+  const m = /^[\\/]{2}([^\\/]+)[\\/]([a-z])\$(?=[\\/]|$)(.*)$/i.exec(String(p ?? ''));
+  if (!m || !isLocalHost(m[1])) return String(p ?? '');
+  return `${m[2].toUpperCase()}:${m[3] ? m[3] : '\\'}`;
+}
+
+const SHORT_NAME_RE = /~\d/;
+const unresolved = new Set();
+
+/**
+ * Expande nomes curtos 8.3 (`C:\Users\x\CLAUDE~2\team`) pelo sistema de arquivos.
+ * Só roda quando algum segmento tem `~<dígito>`. Se o caminho não existe inteiro,
+ * expande o maior ancestral existente e recoloca o resto — desde que o resto não
+ * tenha mais nenhum segmento 8.3. Se tiver (não dá para saber aonde o alias leva),
+ * o alvo fica marcado como **não resolvido** e o guard bloqueia (fail-closed).
+ * Nunca lança.
+ */
+function expandShortNames(p) {
+  if (process.platform !== 'win32' || !SHORT_NAME_RE.test(p)) return p;
+  let head = p;
+  const tail = [];
+  for (let i = 0; i < 64; i++) {
+    try {
+      const real = stripLongPrefix(fs.realpathSync.native(head));
+      if (tail.some((s) => SHORT_NAME_RE.test(s))) break;
+      return tail.length ? path.join(real, ...tail) : real;
+    } catch {
+      const parent = path.dirname(head);
+      if (parent === head) break;
+      tail.unshift(path.basename(head));
+      head = parent;
+    }
+  }
+  unresolved.add(p);
+  return p;
+}
+
+/** O alvo tem nome curto 8.3 que não pôde ser expandido? O guard deve bloquear. */
+export function isUnresolvedAlias(target) {
+  return Boolean(target) && unresolved.has(target);
+}
+
+const canonical = (p) => stripAdminShare(stripLongPrefix(p));
 
 /**
  * Caminho absoluto e normalizado do alvo, ou `null` quando não há alvo.
  * Nunca lança: entrada estranha vira `null` e a regra simplesmente não se aplica.
  */
 export function normalizeTarget(cwd, p) {
-  const raw = stripLongPrefix(p);
+  const raw = canonical(p);
   if (!raw) return null;
   try {
-    return stripLongPrefix(path.resolve(stripLongPrefix(cwd || process.cwd()), raw));
+    return expandShortNames(canonical(path.resolve(canonical(cwd || process.cwd()), raw)));
   } catch {
     return null;
   }
@@ -114,7 +186,7 @@ export function patternTarget(cwd, pattern) {
 /** Diretório do runtime instalado (`~/.claude/team`, ou `AGENT_TEAM_HOME`). */
 export function teamHomeDir() {
   const env = process.env.AGENT_TEAM_HOME;
-  return stripLongPrefix(env ? path.resolve(env) : TEAM_HOME);
+  return expandShortNames(canonical(env ? path.resolve(env) : TEAM_HOME));
 }
 
 /** Arquivo da chave de assinatura das aprovações. Nome fixado pelo ADR-007. */
@@ -130,4 +202,31 @@ export function keyFilePath() {
 export function reachesKey(target) {
   if (!target) return false;
   return isSameOrAncestor(target, keyFilePath()) || isSameOrAncestor(teamHomeDir(), target);
+}
+
+// ---------- defesa em profundidade (por nome, no alvo já normalizado) ----------
+
+const segmentsOf = (p) => String(p ?? '').split(/[\\/]+/).filter(Boolean).map((s) => s.toLowerCase());
+const CLAUDE_DIR_RE = /^(\.claude|claude~\d+)$/;
+const CLAUDE_SHORT_RE = /^claude~\d+$/;
+
+/** O alvo tem o nome do arquivo da chave, em qualquer diretório? */
+export function isKeyAlias(target) {
+  if (!target) return false;
+  const segs = segmentsOf(target);
+  return segs.length > 0 && segs[segs.length - 1] === path.basename(KEY_FILE).toLowerCase();
+}
+
+/**
+ * O alvo parece ser o runtime instalado (ou algo dentro dele) por outro nome?
+ * Segmento `.claude` ou 8.3 `CLAUDE~N` seguido de `team`; ou o próprio `CLAUDE~N`
+ * (ancestral da chave por nome curto). O **texto do padrão** nunca passa por aqui.
+ */
+export function isRuntimeAlias(target) {
+  if (!target) return false;
+  const segs = segmentsOf(target);
+  for (let i = 0; i < segs.length; i++) {
+    if (CLAUDE_DIR_RE.test(segs[i]) && segs[i + 1] === 'team') return true;
+  }
+  return segs.length > 0 && CLAUDE_SHORT_RE.test(segs[segs.length - 1]);
 }

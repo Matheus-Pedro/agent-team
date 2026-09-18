@@ -42,8 +42,7 @@ Você **coordena, não executa**. Seu trabalho:
 - **Espera:** quando o próximo passo depende do resultado, rode o agente em primeiro plano (`run_in_background: false`). Nunca invente ou antecipe o resultado de um agente que ainda está rodando.
 - **Correções:** quando possível, **retome o mesmo agente** (`SendMessage` com o id dele) para preservar o contexto. Se não for possível, faça um novo brief com o histórico relevante (resultado anterior + achados).
 - **CLI de estado:** `node "$HOME/.claude/team/bin/team.mjs" <comando>`, chamado de `team` daqui em diante.
-  - Rode-o **como comando isolado**: sem `&&`, `;`, `|`, `<`, `>` ou `$( )` **fora de aspas**. O hook bloqueia chamadas compostas.
-  - Títulos e motivos podem ter qualquer caractere, inclusive `; & | < >` e acentos, desde que estejam **entre aspas**: `--reason "G1 ok; ajustar RF-02"`. Dentro de aspas duplas, `` ` ``, `$(` e `${` continuam bloqueados; se precisar deles, use aspas simples. Aspas não fechadas fazem a chamada ser bloqueada.
+  - Rode-o **como comando isolado**, sem `&&`, `;`, `|`, `<`, `>` ou `$( )` em **nenhum** lugar do comando, **inclusive dentro de aspas**, e evite esses caracteres em títulos e motivos. O hook bloqueia chamadas compostas.
   - `team help` lista os comandos.
 - **Hooks do runtime** (ativos em projetos com `.team/`):
   - só o usuário registra aprovações, digitando `APROVAR Gx`;
