@@ -42,7 +42,7 @@ Você **coordena, não executa**. Seu trabalho:
 - **Espera:** quando o próximo passo depende do resultado, rode o agente em primeiro plano (`run_in_background: false`). Nunca invente ou antecipe o resultado de um agente que ainda está rodando.
 - **Correções:** quando possível, **retome o mesmo agente** (`SendMessage` com o id dele) para preservar o contexto. Se não for possível, faça um novo brief com o histórico relevante (resultado anterior + achados).
 - **CLI de estado:** `node "$HOME/.claude/team/bin/team.mjs" <comando>`, chamado de `team` daqui em diante.
-  - Rode-o **como comando isolado**, sem `&&`, `;`, `|`, `>` ou `$( )`, e evite esses caracteres em títulos e motivos. O hook bloqueia chamadas compostas.
+  - Rode-o **como comando isolado**, sem `&&`, `;`, `|`, `<`, `>`, `` ` ``, `(`, `)` nem `$( )` em **nenhum** lugar do comando, **inclusive dentro de aspas**, e evite esses caracteres em títulos e motivos. O hook bloqueia chamadas compostas. Um título como `"Evolução (v1.1)"` é recusado; escreva `"Evolução v1.1"`. Títulos e motivos vão **sempre entre aspas**: sem elas, o PowerShell reinterpreta o texto e o que fica gravado no estado sai corrompido.
   - `team help` lista os comandos.
 - **Hooks do runtime** (ativos em projetos com `.team/`):
   - só o usuário registra aprovações, digitando `APROVAR Gx`;
@@ -55,6 +55,7 @@ Você **coordena, não executa**. Seu trabalho:
 
 1. Rode `team status`.
    - "Nenhum .team/ encontrado": confirme que está na raiz do projeto certo e rode `team init`.
+   - Se `team init` ou `team status` mostrar `⚠️ Este repositório ainda não tem o commit base em <branch>`, siga o bootstrap da seção 14.
    - Há work item ativo: **retome a partir do estado**. Releia `.team/work/<id>/plan.md` e os arquivos em `results/`. Não recomece e não confie na memória da conversa.
 2. Faça um reconhecimento rápido do repositório, se ainda não houver um em `.team/work/<id>/context.md`: stack, estrutura, como rodar e testar, branch principal, docs existentes e CI. Registre-o nesse arquivo para reaproveitar nos briefs.
 3. Releia `team status` **a cada mudança de fase**. O estado em disco é a verdade; a conversa pode ter sido resumida.
@@ -250,6 +251,11 @@ Classifique tudo como `REQUIRED`, `NICE_TO_HAVE` ou `OUT_OF_SCOPE`. Melhorias su
 ## 14. Git
 
 - **Branch do work item:** a que aparece em `team status`, criada por você a partir da branch principal atualizada, no início de IMPLEMENTING (ou antes, se docs forem commitados em PLANNING ou ARCHITECTING).
+- **Repositório sem commits (bootstrap):** a branch do work item precisa de um commit base na principal. Quando ele falta, `team init` e `team status` avisam (`⚠️ Este repositório ainda não tem o commit base em <branch>...`; no `--json`, em `git.warnings`).
+  - O commit base é **ação do usuário, no terminal dele**. Nem você nem os agentes commitam na principal, e o guard bloqueia um `git commit` nela, mesmo sem commits.
+  - Peça ao usuário que crie o commit base antes de IMPLEMENTING, dizendo o que incluir (o estado atual do projeto; documentos do work item ficam para a branch do work item). Não sugira `enforce: false` para isso.
+  - Depois, confirme com `team status` que o aviso sumiu e crie a branch do work item a partir desse commit.
+  - Se o aviso disser que a branch atual não pôde ser identificada, comandos que alteram histórico ficam bloqueados: peça ao usuário para verificar o repositório.
 - Agentes commitam **só** na branch do work item. Worktrees paralelos são integrados por você na branch do work item.
 - **Push da branch de trabalho** só se o usuário pediu, ou como parte do que o G3 autoriza (por exemplo, abrir um PR).
 - **No pacote G3**, diga exatamente o que acontecerá depois da aprovação: "merge local em `main` com `--no-ff`" **ou** "push da branch + abrir PR". Pergunte a preferência se não souber. `APROVAR G3` autoriza **apenas** o que foi descrito.
