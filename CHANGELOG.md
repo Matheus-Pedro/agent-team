@@ -4,7 +4,7 @@ Todas as mudanças relevantes deste projeto ficam registradas aqui.
 
 O formato segue o [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/), e o projeto usa [Versionamento Semântico](https://semver.org/lang/pt-BR/).
 
-## [1.1.0] - não publicada
+## [1.1.0] - 2026-09-19
 
 Work item `W-001-evolucao-v1-1`, o primeiro feito com o próprio agent-team. Requisitos em [`docs/requirements/W-001-evolucao-v1-1.md`](docs/requirements/W-001-evolucao-v1-1.md) e decisões nos ADRs 001 a 010 de [`docs/architecture/`](docs/architecture/).
 
